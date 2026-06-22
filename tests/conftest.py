@@ -14,8 +14,8 @@ def settings() -> Settings:
         mango_api_salt=SecretStr("mango-salt"),
         openrouter_api_key=SecretStr("router-key"),
         telegram_bot_token=SecretStr("main-token"),
-        telegram_chat_id="main-chat",
+        telegram_chat_ids="main-chat,main-chat-2",
         telegram_error_bot_token=SecretStr("error-token"),
-        telegram_error_chat_id="error-chat",
+        telegram_error_chat_ids="error-chat,error-chat-2",
         retry_backoff_seconds=0,
     )

@@ -51,11 +51,10 @@ class Settings(BaseSettings):
     mango_default_timezone: str = "Europe/Moscow"
 
     telegram_bot_token: SecretStr = Field(default=SecretStr(""))
-    telegram_chat_id: str = ""
+    telegram_chat_ids: str = ""
     telegram_error_bot_token: SecretStr = Field(default=SecretStr(""))
-    telegram_error_chat_id: str = ""
+    telegram_error_chat_ids: str = ""
     telegram_api_base_url: str = "https://api.telegram.org"
-    dashboard_base_url: str = "https://ainakontrole.ru/app/dashboard"
 
     topic_mango_raw: str = "mango.calls.raw"
     topic_to_transcribe: str = "calls.to_transcribe"
@@ -69,6 +68,18 @@ class Settings(BaseSettings):
     @property
     def mango_fields_list(self) -> list[str]:
         return [item.strip() for item in self.mango_stats_fields.split(",") if item.strip()]
+
+    @staticmethod
+    def _chat_ids(value: str) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value.split(",") if item.strip()))
+
+    @property
+    def telegram_main_chat_ids(self) -> list[str]:
+        return self._chat_ids(self.telegram_chat_ids)
+
+    @property
+    def telegram_failure_chat_ids(self) -> list[str]:
+        return self._chat_ids(self.telegram_error_chat_ids)
 
 
 @lru_cache(maxsize=1)

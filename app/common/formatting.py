@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlencode
 
 from app.common.models import QualityCriteria, QualityResult
 
@@ -19,12 +18,12 @@ def _duration(call: dict[str, Any]) -> str:
         return "-"
 
 
-def _date(call: dict[str, Any]) -> tuple[str, str]:
+def _date(call: dict[str, Any]) -> str:
     try:
         value = datetime.fromisoformat(str(call["started_at"]).replace("Z", "+00:00"))
-        return value.strftime("%d.%m.%Y %H:%M"), value.strftime("%Y-%m-%d")
+        return value.strftime("%d.%m.%Y %H:%M")
     except (KeyError, TypeError, ValueError):
-        return "-", datetime.now().strftime("%Y-%m-%d")
+        return "-"
 
 
 def _manager(call: dict[str, Any]) -> str:
@@ -44,17 +43,13 @@ def _criteria_line(criteria: QualityCriteria) -> str:
     )
 
 
-def format_analysis_message(
-    call: dict[str, Any], quality: QualityResult, dashboard_base_url: str
-) -> str:
+def format_analysis_message(call: dict[str, Any], quality: QualityResult) -> str:
     title = (
         "🚨 РИСК СРЫВА СДЕЛКИ"
         if quality.risk_level == "critical"
         else "📞 АНАЛИЗ ЗВОНКА"
     )
-    started, query_date = _date(call)
-    query = urlencode({"start": query_date, "end": query_date, "funnel": "sales", "callId": call["id"]})
-    dashboard_url = f"{dashboard_base_url}?{query}"
+    started = _date(call)
     errors = "; ".join(quality.errors) if quality.errors else "Критичных ошибок не выявлено"
     return "\n".join(
         [
@@ -83,8 +78,6 @@ def format_analysis_message(
             "",
             "✅ Что делать:",
             quality.recommendation,
-            "",
-            f"🌐 Подробнее: {dashboard_url}",
         ]
     )
 

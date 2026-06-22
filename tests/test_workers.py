@@ -205,22 +205,30 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
         **result,
     }
     repo = SimpleNamespace(
-        notification_exists=AsyncMock(side_effect=[False, True, False]),
+        notification_exists=AsyncMock(side_effect=[False, False, True, True, False, False]),
         get_call_with_results=AsyncMock(return_value=call_data),
         save_notification=AsyncMock(),
+        mark_call_status=AsyncMock(),
     )
-    telegram = SimpleNamespace(send=AsyncMock())
+    telegram = SimpleNamespace(
+        send=AsyncMock(),
+        main_chat_ids=["main-1", "main-2"],
+        error_chat_ids=["error-1", "error-2"],
+    )
     payload = {"event_id": "e1", "call_id": "c1"}
     await telegram_worker.process_notification(payload, repo=repo, telegram=telegram, settings=settings)
     assert "РИСК СРЫВА" in telegram.send.await_args.args[0]
-    repo.save_notification.assert_awaited_with("e1", "c1", "main")
+    assert telegram.send.await_count == 2
+    repo.save_notification.assert_awaited_with("e1", "main-2", "c1", "main")
+    repo.mark_call_status.assert_awaited_with("c1", "notified")
     await telegram_worker.process_notification(payload, repo=repo, telegram=telegram, settings=settings)
-    assert telegram.send.await_count == 1
+    assert telegram.send.await_count == 2
 
     dlq = {"event_id": "e2", "payload": {"call_id": "c1"}, "attempts": 3, "error": "bad"}
     await telegram_worker.process_dead_letter(dlq, repo=repo, telegram=telegram)
     assert telegram.send.await_args.kwargs["error_channel"] is True
-    repo.save_notification.assert_awaited_with("e2", "c1", "error")
+    assert telegram.send.await_count == 4
+    repo.save_notification.assert_awaited_with("e2", "error-2", "c1", "error")
 
 
 @pytest.mark.asyncio
@@ -229,7 +237,7 @@ async def test_telegram_worker_validates_payload_and_analysis(settings) -> None:
         notification_exists=AsyncMock(return_value=False),
         get_call_with_results=AsyncMock(return_value=None),
     )
-    telegram = SimpleNamespace(send=AsyncMock())
+    telegram = SimpleNamespace(send=AsyncMock(), main_chat_ids=["main"], error_chat_ids=["error"])
     with pytest.raises(ValueError, match="event_id/call_id"):
         await telegram_worker.process_notification({}, repo=repo, telegram=telegram, settings=settings)
     with pytest.raises(ValueError, match="No analysis"):
@@ -241,9 +249,63 @@ async def test_telegram_worker_validates_payload_and_analysis(settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_telegram_worker_retries_only_missing_recipients(settings) -> None:
+    call_data = {
+        "id": "c1",
+        "score": 80,
+        "risk_level": "normal",
+        "risk_reason": "Риска нет",
+        "summary": "Успешный звонок",
+        "errors": [],
+        "recommendation": "Продолжить работу",
+        "criteria": {
+            "greeting": 80,
+            "needs_discovery": 80,
+            "urgency": 80,
+            "target_action": 80,
+            "objection_handling": 80,
+            "closing": 80,
+        },
+        "raw": {},
+    }
+    repo = SimpleNamespace(
+        get_call_with_results=AsyncMock(return_value=call_data),
+        notification_exists=AsyncMock(side_effect=[False, False, True, False]),
+        save_notification=AsyncMock(),
+        mark_call_status=AsyncMock(),
+    )
+    telegram = SimpleNamespace(
+        main_chat_ids=["first", "second"],
+        send=AsyncMock(side_effect=[None, RuntimeError("temporary"), None]),
+    )
+    payload = {"event_id": "e1", "call_id": "c1"}
+    with pytest.raises(RuntimeError, match="temporary"):
+        await telegram_worker.process_notification(payload, repo=repo, telegram=telegram, settings=settings)
+    await telegram_worker.process_notification(payload, repo=repo, telegram=telegram, settings=settings)
+    assert telegram.send.await_count == 3
+    assert telegram.send.await_args.kwargs["chat_id"] == "second"
+    repo.mark_call_status.assert_awaited_once_with("c1", "notified")
+
+
+@pytest.mark.asyncio
+async def test_telegram_worker_rejects_empty_recipient_lists(settings) -> None:
+    call_data = {"id": "c1", "score": 1, **quality().model_dump(mode="json")}
+    repo = SimpleNamespace(get_call_with_results=AsyncMock(return_value=call_data))
+    telegram = SimpleNamespace(main_chat_ids=[], error_chat_ids=[], send=AsyncMock())
+    with pytest.raises(RuntimeError, match="TELEGRAM_CHAT_IDS"):
+        await telegram_worker.process_notification(
+            {"event_id": "e", "call_id": "c1"}, repo=repo, telegram=telegram, settings=settings
+        )
+    with pytest.raises(RuntimeError, match="TELEGRAM_ERROR_CHAT_IDS"):
+        await telegram_worker.process_dead_letter({"event_id": "e", "payload": {}}, repo=repo, telegram=telegram)
+
+
+@pytest.mark.asyncio
 async def test_error_bot_delivery_is_retried_three_times(settings) -> None:
     repo = SimpleNamespace(notification_exists=AsyncMock(return_value=False))
-    telegram = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("telegram down")))
+    telegram = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("telegram down")), error_chat_ids=["error"]
+    )
     payload = {"event_id": "e", "payload": {"call_id": "c"}}
     with pytest.raises(RuntimeError, match="telegram down"):
         await telegram_worker.process_dead_letter_with_retries(

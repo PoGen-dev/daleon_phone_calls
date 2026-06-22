@@ -34,8 +34,15 @@ def quality(**overrides) -> QualityResult:
 
 
 def test_settings_parse_fields_and_cache() -> None:
-    value = Settings(_env_file=None, mango_stats_fields=" one, two ,,three ")
+    value = Settings(
+        _env_file=None,
+        mango_stats_fields=" one, two ,,three ",
+        telegram_chat_ids=" 1,2,1,, ",
+        telegram_error_chat_ids=" 3, 4 ",
+    )
     assert value.mango_fields_list == ["one", "two", "three"]
+    assert value.telegram_main_chat_ids == ["1", "2"]
+    assert value.telegram_failure_chat_ids == ["3", "4"]
     get_settings.cache_clear()
     assert get_settings() is get_settings()
     get_settings.cache_clear()
@@ -80,16 +87,17 @@ def test_analysis_message_matches_business_template() -> None:
         "recording_url": "https://example.test/play/1",
         "raw": {"user_name": "user2", "deal_id": "42"},
     }
-    message = format_analysis_message(call, quality(), "https://ainakontrole.ru/app/dashboard")
+    message = format_analysis_message(call, quality())
     assert "🚨 РИСК СРЫВА СДЕЛКИ" in message
     assert "👤 user2 · incoming · 79990000000" in message
     assert "07.05.2026 18:00 · 3:44" in message
     assert "👋75 · 🔍60 · 🔥20 · 🎯80 · 🛡40 · 🏁40" in message
-    assert "callId=137630" in message and "Сделка: 42" in message
+    assert "Сделка: 42" in message
+    assert "Подробнее" not in message
 
 
 def test_noncritical_message_and_missing_call_fields() -> None:
-    message = format_analysis_message({"id": "x", "raw": {}}, quality(risk_level="normal", errors=[]), "https://x")
+    message = format_analysis_message({"id": "x", "raw": {}}, quality(risk_level="normal", errors=[]))
     assert message.startswith("📞 АНАЛИЗ ЗВОНКА")
     assert "Критичных ошибок не выявлено" in message
     assert "📅 - · -" in message

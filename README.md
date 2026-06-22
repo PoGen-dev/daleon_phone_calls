@@ -15,6 +15,7 @@
 ```bash
 cp .env.example .env
 # заполните MANGO_*, OPENROUTER_API_KEY и оба набора TELEGRAM_*
+# TELEGRAM_CHAT_IDS и TELEGRAM_ERROR_CHAT_IDS содержат chat_id через запятую
 docker compose up --build -d
 docker compose ps
 ```
@@ -44,7 +45,7 @@ docker compose ps
 - `calls`: метаданные Mango, статус и путь объекта MinIO.
 - `transcriptions`: текст, модель и сырой ответ транскрибации.
 - `quality_scores`: риск, итог, ошибки, рекомендация и шесть метрик.
-- `notifications`: ключи идемпотентности отправленных Telegram-событий.
+- `notifications`: ключи идемпотентности Telegram-событий для каждого `chat_id`.
 - `worker_state`: cursor опроса Mango.
 
 Полный результат доступен по `GET /calls/{call_id}`. `GET /health` проверяет PostgreSQL и MinIO.
@@ -74,6 +75,12 @@ docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:9092 -
 ```
 
 Для повторного создания схемы после изменения `init.sql` удалите локальные volumes: `docker compose down -v`.
+
+Для обновления уже работающей базы без удаления данных выполните:
+
+```bash
+docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations/002_telegram_chat_ids.sql
+```
 
 ## Production
 

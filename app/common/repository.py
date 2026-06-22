@@ -190,33 +190,43 @@ class Repository:
                 await conn.execute("UPDATE calls SET status='analyzed', error=NULL WHERE id=$1", call_id)
 
     async def notification_exists(
-        self, event_id: str, call_id: str | None = None, channel: str | None = None
+        self,
+        event_id: str,
+        chat_id: str,
+        call_id: str | None = None,
+        channel: str | None = None,
     ) -> bool:
         async with self.pg.acquire() as conn:
             value = await conn.fetchval(
                 """
                 SELECT EXISTS(
                     SELECT 1 FROM notifications
-                    WHERE event_id=$1 OR ($2::text IS NOT NULL AND call_id=$2 AND channel=$3)
+                    WHERE (event_id=$1 AND chat_id=$2)
+                        OR ($3::text IS NOT NULL AND call_id=$3 AND channel=$4 AND chat_id=$2)
                 )
                 """,
                 event_id,
+                chat_id,
                 call_id,
                 channel,
             )
         return bool(value)
 
-    async def save_notification(self, event_id: str, call_id: str | None, channel: str) -> None:
+    async def save_notification(
+        self, event_id: str, chat_id: str, call_id: str | None, channel: str
+    ) -> None:
         async with self.pg.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
-                    "INSERT INTO notifications (event_id, call_id, channel) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                    """
+                    INSERT INTO notifications (event_id, chat_id, call_id, channel)
+                    VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING
+                    """,
                     event_id,
+                    chat_id,
                     call_id,
                     channel,
                 )
-                if call_id and channel == "main":
-                    await conn.execute("UPDATE calls SET status='notified', error=NULL WHERE id=$1", call_id)
 
     async def get_state(self, name: str) -> dict[str, Any] | None:
         async with self.pg.acquire() as conn:

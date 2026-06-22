@@ -24,14 +24,19 @@ async def process_notification(
     call_id = payload.get("call_id")
     if not event_id or not call_id:
         raise ValueError("Notification payload has no event_id/call_id")
-    if await repo.notification_exists(event_id, call_id, "main"):
-        return
     call = await repo.get_call_with_results(call_id)
     if not call or call.get("score") is None:
         raise ValueError(f"No analysis for call_id={call_id}")
     quality = QualityResult.model_validate(call)
-    await telegram.send(format_analysis_message(call, quality, settings.dashboard_base_url))
-    await repo.save_notification(event_id, call_id, "main")
+    if not telegram.main_chat_ids:
+        raise RuntimeError("TELEGRAM_CHAT_IDS is empty")
+    message = format_analysis_message(call, quality)
+    for chat_id in telegram.main_chat_ids:
+        if await repo.notification_exists(event_id, chat_id, call_id, "main"):
+            continue
+        await telegram.send(message, chat_id=chat_id)
+        await repo.save_notification(event_id, chat_id, call_id, "main")
+    await repo.mark_call_status(call_id, "notified")
     logger.info("Telegram notification sent", extra={"call_id": call_id})
 
 
@@ -39,10 +44,15 @@ async def process_dead_letter(payload: dict[str, Any], *, repo: Repository, tele
     event_id = payload.get("event_id")
     if not event_id:
         raise ValueError("Dead-letter payload has no event_id")
-    if await repo.notification_exists(event_id):
-        return
-    await telegram.send(format_dead_letter_message(payload), error_channel=True)
-    await repo.save_notification(event_id, (payload.get("payload") or {}).get("call_id"), "error")
+    if not telegram.error_chat_ids:
+        raise RuntimeError("TELEGRAM_ERROR_CHAT_IDS is empty")
+    call_id = (payload.get("payload") or {}).get("call_id")
+    message = format_dead_letter_message(payload)
+    for chat_id in telegram.error_chat_ids:
+        if await repo.notification_exists(event_id, chat_id):
+            continue
+        await telegram.send(message, chat_id=chat_id, error_channel=True)
+        await repo.save_notification(event_id, chat_id, call_id, "error")
     logger.info("Dead-letter notification sent", extra={"event_id": event_id})
 
 

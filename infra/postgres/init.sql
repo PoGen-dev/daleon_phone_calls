@@ -49,14 +49,16 @@ CREATE TABLE IF NOT EXISTS quality_scores (
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
-    event_id TEXT PRIMARY KEY,
+    event_id TEXT,
+    chat_id TEXT NOT NULL,
     call_id TEXT,
     channel TEXT NOT NULL CHECK (channel IN ('main', 'error')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (event_id, chat_id)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_main_call
-ON notifications(call_id) WHERE channel = 'main';
+ON notifications(call_id, chat_id) WHERE channel = 'main';
 
 CREATE TABLE IF NOT EXISTS worker_state (
     name TEXT PRIMARY KEY,

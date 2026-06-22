@@ -136,11 +136,11 @@ async def test_quality_and_notification_operations() -> None:
 
     conn.fetchval.side_effect = [True, False]
     assert await repo.quality_exists("c1")
-    assert not await repo.notification_exists("e1")
-    await repo.save_notification("e1", "c1", "main")
+    assert not await repo.notification_exists("e1", "chat-1")
+    await repo.save_notification("e1", "chat-1", "c1", "main")
+    assert conn.execute.await_count == 3
+    await repo.save_notification("e2", "chat-2", None, "error")
     assert conn.execute.await_count == 4
-    await repo.save_notification("e2", None, "error")
-    assert conn.execute.await_count == 5
 
 
 @pytest.mark.asyncio

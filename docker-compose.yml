@@ -9,6 +9,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+      - ./infra/postgres/migrations/002_telegram_chat_ids.sql:/docker-entrypoint-initdb.d/002-telegram-chat-ids.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d calls"]
       interval: 5s
