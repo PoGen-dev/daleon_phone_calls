@@ -3,7 +3,8 @@
 Асинхронный pipeline обработки звонков MANGO OFFICE:
 
 1. `mango-worker` опрашивает Mango, проверяет аудио, сохраняет его в MinIO, а метаданные и Kafka outbox — в PostgreSQL.
-2. `transcriber-worker` получает объект MinIO из Kafka, вызывает `gpt-4o-transcribe` через OpenRouter и сохраняет текст.
+2. `transcriber-worker` получает объект MinIO из Kafka, отправляет его в Base64 на JSON STT endpoint OpenRouter и
+   сохраняет транскрипцию `gpt-4o-transcribe`.
 3. `quality-worker` анализирует текст через `gpt-4o-mini`, сохраняет метрики и публикует задачу уведомления.
 4. `telegram-worker` отправляет результат основным ботом, а DLQ после третьей ошибки — отдельным ботом.
 
@@ -76,6 +77,18 @@ docker compose exec postgres psql -U app -d calls -c "select call_id,score,risk_
 docker compose exec postgres psql -U app -d calls -c "select id,topic,attempts,last_error from outbox_events where published_at is null order by id"
 docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:9092 --topic calls.dead_letter --from-beginning --max-messages 1
 ```
+
+Одноразовая обработка последнего звонка с записью за предыдущие 7 дней:
+
+```bash
+docker compose stop mango-worker
+docker compose run --rm -e MANGO_TEST_LATEST_CALL_ONLY=true mango-worker
+docker compose start mango-worker
+```
+
+Период поиска задаётся переменной `MANGO_TEST_LOOKBACK_SECONDS`. Этот режим не изменяет cursor штатного опроса и
+завершается после обработки одного звонка. Идемпотентность сохраняется: уже обработанный звонок не создаёт повторные
+задачи и уведомления.
 
 Для повторного создания схемы после изменения `init.sql` удалите локальные volumes: `docker compose down -v`.
 

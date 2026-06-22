@@ -11,11 +11,12 @@ from app.clients.mango import MangoApiError, MangoClient
 
 
 class Response:
-    def __init__(self, *, data=None, text="", content=b"audio", headers=None) -> None:
+    def __init__(self, *, data=None, text="", content=b"audio", headers=None, status_code=200) -> None:
         self._data = data
         self.text = text
         self.content = content
         self.headers = headers or {}
+        self.status_code = status_code
         self.raise_for_status = lambda: None
 
     def json(self):
@@ -42,7 +43,8 @@ async def test_request_handles_json_text_empty_and_missing_credentials(settings)
                 Response(data={"key": "1"}, headers={"content-type": "application/json"}),
                 Response(text='{"value": 2}'),
                 Response(text="plain"),
-                Response(text=""),
+                Response(text="", content=b""),
+                Response(text="", content=b"", status_code=204),
             ]
         )
     )
@@ -50,6 +52,7 @@ async def test_request_handles_json_text_empty_and_missing_credentials(settings)
     assert await client.request("stats", {}) == {"value": 2}
     assert await client.request("stats", {}) == "plain"
     assert await client.request("stats", {}) is None
+    assert await client.request_with_status("stats", {}) == (204, None)
     request = client.http.post.await_args_list[0]
     assert request.args[0].endswith("/stats") and request.kwargs["data"]["vpbx_api_key"] == "mango-key"
 
@@ -63,11 +66,11 @@ async def test_fetch_calls_polls_until_ready(settings, monkeypatch) -> None:
     settings.mango_stats_fields = "call_id,records,start,finish"
     client = MangoClient(settings)
     initial = {"result": {"key": "report-key", "expires": 1710000300}}
-    client.request = AsyncMock(
+    client.request = AsyncMock(return_value=initial)
+    client.request_with_status = AsyncMock(
         side_effect=[
-            initial,
-            {"code": 202},
-            {"data": [{"call_id": "c1", "records": "r1", "start": "1710000000"}]},
+            (204, None),
+            (200, {"data": [{"call_id": "c1", "records": "r1", "start": "1710000000"}]}),
         ]
     )
     sleep = AsyncMock()
@@ -78,8 +81,12 @@ async def test_fetch_calls_polls_until_ready(settings, monkeypatch) -> None:
     )
     assert calls[0].id == "c1" and calls[0].recording_id == "r1"
     request_payload = client.request.await_args_list[0].args[1]
-    result_payload = client.request.await_args_list[1].args[1]
+    result_payload = client.request_with_status.await_args_list[0].args[1]
     assert "request_id" not in request_payload
+    assert request_payload["date_from"] == "1767225600"
+    assert request_payload["date_to"] == "1767312000"
+    assert request_payload["from"] == {"extension": "", "number": ""}
+    assert request_payload["to"] == {"extension": "", "number": ""}
     assert result_payload == initial["result"]
     sleep.assert_awaited_once()
     await client.aclose()
@@ -93,10 +100,24 @@ async def test_fetch_calls_rejects_missing_key_and_poll_timeout(settings, monkey
         await client.fetch_calls(datetime.now(timezone.utc), datetime.now(timezone.utc))
 
     settings.mango_result_poll_attempts = 2
-    client.request = AsyncMock(side_effect=[{"key": "k"}, None, {"code": 202}])
+    client.request = AsyncMock(return_value={"key": "k"})
+    client.request_with_status = AsyncMock(side_effect=[(204, None), (202, None)])
     monkeypatch.setattr("app.clients.mango.asyncio.sleep", AsyncMock())
     with pytest.raises(MangoApiError, match="not ready"):
         await client.fetch_calls(datetime.now(timezone.utc), datetime.now(timezone.utc))
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_calls_treats_empty_200_as_ready_report(settings) -> None:
+    client = MangoClient(settings)
+    client.request = AsyncMock(return_value={"key": "empty-report"})
+    client.request_with_status = AsyncMock(return_value=(200, None))
+
+    calls = await client.fetch_calls(datetime.now(timezone.utc), datetime.now(timezone.utc))
+
+    assert calls == []
+    client.request_with_status.assert_awaited_once()
     await client.aclose()
 
 

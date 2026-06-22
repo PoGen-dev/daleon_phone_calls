@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     openrouter_http_referer: str | None = None
     openrouter_app_name: str = "Mango Transcribe Analysis"
     openai_transcribe_model: str = "openai/gpt-4o-transcribe"
+    openai_transcribe_language: str | None = "ru"
     openai_quality_model: str = "openai/gpt-4o-mini"
     openai_quality_temperature: float = 0.0
 
@@ -47,6 +48,8 @@ class Settings(BaseSettings):
     mango_result_poll_attempts: int = 60
     mango_result_poll_interval_seconds: int = 5
     mango_worker_concurrency: int = Field(default=4, ge=1)
+    mango_test_latest_call_only: bool = False
+    mango_test_lookback_seconds: int = Field(default=604800, ge=60)
     mango_stats_fields: Annotated[str, Field(description="Comma-separated Mango stats fields")] = (
         "records,start,finish,answer,from_extension,from_number,to_extension,"
         "to_number,disconnect_reason,line_number,location,entry_id"

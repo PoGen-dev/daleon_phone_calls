@@ -89,14 +89,17 @@ async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch) -
     completion = Dumpable({"choices": []})
     completion.choices = [SimpleNamespace(message=SimpleNamespace(content=__import__("json").dumps(quality)))]
     fake = SimpleNamespace(
-        audio=SimpleNamespace(
-            transcriptions=SimpleNamespace(create=AsyncMock(return_value=Dumpable({"text": "привет"})))
-        ),
         chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
         close=AsyncMock(),
     )
+    stt_response = SimpleNamespace(
+        raise_for_status=MagicMock(),
+        json=lambda: {"text": "привет", "usage": {"seconds": 1}},
+    )
+    stt_http = SimpleNamespace(post=AsyncMock(return_value=stt_response), aclose=AsyncMock())
     constructor = MagicMock(return_value=fake)
     monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", constructor)
+    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
     settings.openrouter_http_referer = "https://app.example"
     ai = OpenAIQaClient(settings)
     text, raw = await ai.transcribe(audio=b"audio", filename="call.mp3")
@@ -106,25 +109,57 @@ async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch) -
     kwargs = constructor.call_args.kwargs
     assert kwargs["base_url"] == settings.openrouter_base_url
     assert kwargs["default_headers"]["HTTP-Referer"] == "https://app.example"
+    stt_payload = stt_http.post.await_args.kwargs["json"]
+    assert stt_payload == {
+        "model": "openai/gpt-4o-transcribe",
+        "input_audio": {"data": "YXVkaW8=", "format": "mp3"},
+        "language": "ru",
+    }
     assert QUALITY_JSON_SCHEMA["schema"]["additionalProperties"] is False
     await ai.aclose()
     fake.close.assert_awaited_once()
+    stt_http.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_openrouter_transcription_fallback_and_empty_completion(settings, monkeypatch) -> None:
-    transcription = SimpleNamespace(text="fallback")
     completion = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None))])
     fake = SimpleNamespace(
-        audio=SimpleNamespace(transcriptions=SimpleNamespace(create=AsyncMock(return_value=transcription))),
         chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
         close=AsyncMock(),
     )
+    stt_http = SimpleNamespace(
+        post=AsyncMock(
+            return_value=SimpleNamespace(raise_for_status=MagicMock(), json=lambda: {"text": "fallback"})
+        ),
+        aclose=AsyncMock(),
+    )
     monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
+    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
     ai = OpenAIQaClient(settings)
-    assert (await ai.transcribe(audio=b"x", filename="x"))[0] == "fallback"
+    assert (await ai.transcribe(audio=b"x", filename="x.wav"))[0] == "fallback"
     with pytest.raises(Exception):
         await ai.score_quality(transcript="x")
+    await ai.aclose()
+
+
+@pytest.mark.parametrize(
+    ("filename", "audio", "expected"),
+    [
+        ("recording", b"RIFF0000WAVEaudio", "wav"),
+        ("recording.mp3", b"RIFF0000WAVEaudio", "wav"),
+        ("recording", b"ID3audio", "mp3"),
+        ("call.oga", b"audio", "ogg"),
+        ("call.mp4", b"audio", "m4a"),
+    ],
+)
+def test_openrouter_detects_audio_format(filename, audio, expected) -> None:
+    assert OpenAIQaClient._audio_format(filename, audio) == expected
+
+
+def test_openrouter_rejects_unknown_audio_format() -> None:
+    with pytest.raises(ValueError, match="Cannot determine"):
+        OpenAIQaClient._audio_format("recording.bin", b"unknown")
 
 
 @pytest.mark.asyncio

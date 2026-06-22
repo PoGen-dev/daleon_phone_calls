@@ -72,8 +72,14 @@ class MangoClient:
         response = await self._post(endpoint, payload)
         return self._decode_response(response)
 
+    async def request_with_status(self, endpoint: str, payload: dict[str, Any]) -> tuple[int, Any]:
+        response = await self._post(endpoint, payload)
+        return response.status_code, self._decode_response(response)
+
     @staticmethod
     def _decode_response(response: httpx.Response) -> Any:
+        if not response.content:
+            return None
         content_type = response.headers.get("content-type", "")
         if "application/json" in content_type:
             return response.json()
@@ -88,8 +94,10 @@ class MangoClient:
     async def fetch_calls(self, date_from: datetime, date_to: datetime) -> list[CallRecord]:
         fields = self.settings.mango_fields_list
         request_payload = {
-            "date_from": int(date_from.timestamp()),
-            "date_to": int(date_to.timestamp()),
+            "date_from": str(int(date_from.timestamp())),
+            "date_to": str(int(date_to.timestamp())),
+            "from": {"extension": "", "number": ""},
+            "to": {"extension": "", "number": ""},
             "fields": ",".join(fields),
         }
         initial = await self.request(self.settings.mango_stats_request_endpoint, request_payload)
@@ -98,18 +106,37 @@ class MangoClient:
             raise MangoApiError(f"Mango stats/request did not return key: {initial!r}")
 
         result_payload = self._stats_result_payload(initial, key)
+        report_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+        response_fields = sorted(initial) if isinstance(initial, dict) else [type(initial).__name__]
+        logger.info(
+            "Mango stats report accepted: report_id=%s date_from=%s date_to=%s fields=%s response_fields=%s",
+            report_id,
+            request_payload["date_from"],
+            request_payload["date_to"],
+            request_payload["fields"],
+            response_fields,
+        )
         result: Any = None
         for attempt in range(1, self.settings.mango_result_poll_attempts + 1):
-            result = await self.request(self.settings.mango_stats_result_endpoint, result_payload)
-            if self._is_result_ready(result):
+            status_code, result = await self.request_with_status(
+                self.settings.mango_stats_result_endpoint,
+                result_payload,
+            )
+            if status_code == 200 and result is None:
+                result = {"data": []}
+                break
+            if status_code not in {202, 204} and self._is_result_ready(result):
                 break
             logger.info(
-                "Mango stats result is not ready: attempt=%s/%s result=%r",
+                "Mango stats result is not ready: report_id=%s attempt=%s/%s status=%s result=%r",
+                report_id,
                 attempt,
                 self.settings.mango_result_poll_attempts,
+                status_code,
                 result,
             )
-            await asyncio.sleep(self.settings.mango_result_poll_interval_seconds)
+            if attempt < self.settings.mango_result_poll_attempts:
+                await asyncio.sleep(self.settings.mango_result_poll_interval_seconds)
         else:
             raise MangoApiError(f"Mango stats/result is not ready after polling: {result!r}")
 

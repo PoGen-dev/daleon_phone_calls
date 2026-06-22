@@ -48,6 +48,14 @@ def _poll_window(last_cursor: datetime | None, now: datetime, settings: Settings
     return date_from, date_to
 
 
+def _latest_recorded_call(calls: list[CallRecord]) -> CallRecord | None:
+    candidates = [call for call in calls if call.recording_url or call.recording_id]
+    if not candidates:
+        return None
+    earliest = datetime.min.replace(tzinfo=timezone.utc)
+    return max(candidates, key=lambda call: call.finished_at or call.started_at or earliest)
+
+
 async def _store_call(
     call: CallRecord,
     *,
@@ -168,6 +176,31 @@ async def run() -> None:
 
         try:
             await storage.ensure_bucket()
+            if settings.mango_test_latest_call_only:
+                await flush_outbox()
+                now = datetime.now(timezone.utc)
+                date_from = now - timedelta(seconds=settings.mango_test_lookback_seconds)
+                logger.info(
+                    "Mango latest-call test started: date_from=%s date_to=%s",
+                    date_from.isoformat(),
+                    now.isoformat(),
+                )
+                calls = await mango.fetch_calls(date_from, now)
+                latest = _latest_recorded_call(calls)
+                if latest is None:
+                    logger.warning("Mango latest-call test found no calls with recordings: count=%s", len(calls))
+                    return
+                logger.info(
+                    "Mango latest-call test selected: call_id=%s started_at=%s finished_at=%s",
+                    latest.id,
+                    latest.started_at,
+                    latest.finished_at,
+                )
+                await process(latest)
+                await flush_outbox()
+                logger.info("Mango latest-call test completed: call_id=%s", latest.id)
+                return
+
             while True:
                 await flush_outbox()
                 state = await repo.get_state(STATE_NAME) or {}
@@ -185,7 +218,7 @@ async def run() -> None:
                     await asyncio.sleep(settings.mango_poll_interval_seconds)
                     continue
 
-                logger.info("Mango calls fetched", extra={"count": len(calls)})
+                logger.info("Mango calls fetched: count=%s", len(calls))
                 await asyncio.gather(*(process(call) for call in calls))
                 await flush_outbox()
                 await repo.set_state(

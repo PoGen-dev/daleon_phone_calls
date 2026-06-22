@@ -59,6 +59,20 @@ def test_cursor_and_poll_windows(settings) -> None:
     )
 
 
+def test_latest_recorded_call_selects_newest_eligible_call() -> None:
+    older = call(id="older", recording_id="r1", finished_at=datetime(2026, 5, 7, 18, tzinfo=timezone.utc))
+    newer = call(id="newer", recording_id="r2", finished_at=datetime(2026, 5, 8, 18, tzinfo=timezone.utc))
+    no_recording = call(
+        id="ignored",
+        recording_id=None,
+        recording_url=None,
+        finished_at=datetime(2026, 5, 9, 18, tzinfo=timezone.utc),
+    )
+
+    assert mango_worker._latest_recorded_call([newer, no_recording, older]) == newer
+    assert mango_worker._latest_recorded_call([no_recording]) is None
+
+
 @pytest.mark.asyncio
 async def test_mango_store_downloads_uploads_and_enqueues(settings) -> None:
     repo = SimpleNamespace(
