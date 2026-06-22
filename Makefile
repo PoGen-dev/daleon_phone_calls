@@ -1,4 +1,4 @@
-.PHONY: up down logs test compile
+.PHONY: up down logs test compile lint patch
 
 up:
 	docker compose up --build
@@ -14,3 +14,9 @@ test:
 
 compile:
 	python -m compileall app
+
+lint:
+	ruff check app tests
+
+patch:
+	git diff --binary > mango-transcribe-analysis.patch

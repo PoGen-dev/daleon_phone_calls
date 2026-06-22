@@ -1,0 +1,3167 @@
+diff --git a/.env.example b/.env.example
+index 02c8e63..850f94d 100644
+--- a/.env.example
++++ b/.env.example
+@@ -2,14 +2,23 @@ APP_ENV=local
+ LOG_LEVEL=INFO
+ 
+ POSTGRES_DSN=postgresql://app:app@postgres:5432/calls
+-MONGO_DSN=mongodb://mongo:27017
+-MONGO_DATABASE=mango_calls
+ KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+ KAFKA_GROUP_PREFIX=mango-calls-local
++RETRY_MAX_ATTEMPTS=3
++RETRY_BACKOFF_SECONDS=2
+ 
+-OPENAI_API_KEY=replace-me
+-OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe
+-OPENAI_QUALITY_MODEL=gpt-4o-mini
++MINIO_ENDPOINT=minio:9000
++MINIO_ACCESS_KEY=minioadmin
++MINIO_SECRET_KEY=minioadmin
++MINIO_BUCKET=mango-calls
++MINIO_SECURE=false
++
++OPENROUTER_API_KEY=replace-me
++OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
++OPENROUTER_HTTP_REFERER=
++OPENROUTER_APP_NAME=Mango Transcribe Analysis
++OPENAI_TRANSCRIBE_MODEL=openai/gpt-4o-transcribe
++OPENAI_QUALITY_MODEL=openai/gpt-4o-mini
+ OPENAI_QUALITY_TEMPERATURE=0
+ 
+ MANGO_API_BASE_URL=https://app.mango-office.ru/vpbx
+@@ -23,14 +32,22 @@ MANGO_LOOKBACK_SECONDS=300
+ MANGO_REQUEST_WINDOW_SECONDS=300
+ MANGO_RESULT_POLL_ATTEMPTS=12
+ MANGO_RESULT_POLL_INTERVAL_SECONDS=5
++MANGO_WORKER_CONCURRENCY=4
+ MANGO_STATS_FIELDS=records,start,finish,from_extension,from_number,to_extension,to_number,disconnect_reason
+ MANGO_DEFAULT_TIMEZONE=Europe/Moscow
+ 
++TELEGRAM_BOT_TOKEN=replace-me
++TELEGRAM_CHAT_ID=replace-me
++TELEGRAM_ERROR_BOT_TOKEN=replace-me
++TELEGRAM_ERROR_CHAT_ID=replace-me
++TELEGRAM_API_BASE_URL=https://api.telegram.org
++DASHBOARD_BASE_URL=https://ainakontrole.ru/app/dashboard
++
+ TOPIC_MANGO_RAW=mango.calls.raw
+ TOPIC_TO_TRANSCRIBE=calls.to_transcribe
+-TOPIC_TRANSCRIBED=calls.transcribed
+-TOPIC_QUALITY=calls.quality
++TOPIC_TO_ANALYZE=calls.to_analyze
++TOPIC_TO_NOTIFY=calls.to_notify
+ TOPIC_DEAD_LETTER=calls.dead_letter
+ 
+ API_HOST=0.0.0.0
+-API_PORT=8080
+\ No newline at end of file
++API_PORT=8080
+diff --git a/Makefile b/Makefile
+index 83590b8..0f7be13 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,4 @@
+-.PHONY: up down logs test compile
++.PHONY: up down logs test compile lint patch
+ 
+ up:
+ 	docker compose up --build
+@@ -13,4 +13,10 @@ test:
+ 	pytest
+ 
+ compile:
+-	python -m compileall app
+\ No newline at end of file
++	python -m compileall app
++
++lint:
++	ruff check app tests
++
++patch:
++	git diff --binary > mango-transcribe-analysis.patch
+diff --git a/README.md b/README.md
+index ac4cb2c..9045742 100644
+--- a/README.md
++++ b/README.md
+@@ -1,88 +1,81 @@
+-# Mango Calls QA Microservices
++# Mango Transcribe Analysis
+ 
+-Асинхронный Python-проект для обработки звонков MANGO OFFICE через микросервисную архитектуру:
++Асинхронный pipeline обработки звонков MANGO OFFICE:
+ 
+-1. `mango-worker` периодически опрашивает API Mango, сохраняет сырой звонок в PostgreSQL/MongoDB и публикует задачу в Kafka.
+-2. `transcriber-worker` забирает задачу, скачивает аудио, вызывает `gpt-4o-transcribe`/`gpt-transcribe`-совместимую модель OpenAI, сохраняет транскрипт и публикует событие.
+-3. `quality-worker` оценивает качество разговора через OpenAI LLM в строгий JSON, сохраняет результат в PostgreSQL/MongoDB.
+-4. `api` даёт health-check и чтение результата по `call_id`.
++1. `mango-worker` опрашивает Mango, параллельно сохраняет аудио в MinIO и метаданные в PostgreSQL.
++2. `transcriber-worker` получает объект MinIO из Kafka, вызывает `gpt-4o-transcribe` через OpenRouter и сохраняет текст.
++3. `quality-worker` анализирует текст через `gpt-4o-mini`, сохраняет метрики и публикует задачу уведомления.
++4. `telegram-worker` отправляет результат основным ботом, а DLQ после третьей ошибки — отдельным ботом.
+ 
+-## Быстрый старт
++Каждый Kafka-task содержит `attempt`. При ошибке задача повторно публикуется в исходный topic; после третьей попытки
++создаётся событие `dead_letter`. Записи в PostgreSQL и уведомления идемпотентны.
+ 
+-```bash
+-cp .env.example .env
+-# заполните OPENAI_API_KEY, MANGO_API_KEY, MANGO_API_SALT
+-# при необходимости уточните MANGO_* endpoint'ы под ваш кабинет/API-версию
+-
+-docker compose up --build
+-```
+-
+-Проверка:
++## Запуск
+ 
+ ```bash
+-curl http://localhost:8080/health
+-curl http://localhost:8080/calls/<call_id>
++cp .env.example .env
++# заполните MANGO_*, OPENROUTER_API_KEY и оба набора TELEGRAM_*
++docker compose up --build -d
++docker compose ps
+ ```
+ 
+-## Сервисы
+-
+-| Сервис | Назначение |
+-|---|---|
+-| `api` | FastAPI для проверки состояния и чтения результата |
+-| `mango-worker` | polling Mango API, сохранение звонков, Kafka task |
+-| `transcriber-worker` | скачивание аудио, OpenAI transcription, сохранение транскрипта |
+-| `quality-worker` | LLM-оценка качества разговора, сохранение оценки |
+-| `postgres` | реляционные индексы, статусы, транскрипции, оценки |
+-| `mongodb` | сырые JSON-пayload'ы и полные документы |
+-| `kafka` | передача задач между воркерами |
+-
+-## Kafka topics
++Интерфейсы после запуска:
+ 
+-- `mango.calls.raw` — сырой обнаруженный звонок.
+-- `calls.to_transcribe` — задача на транскрибацию.
+-- `calls.transcribed` — событие о готовом транскрипте.
+-- `calls.quality` — событие о готовой оценке.
+-- `calls.dead_letter` — ошибки обработки.
++- API: `http://localhost:8080`
++- MinIO API: `http://localhost:9000`
++- MinIO Console: `http://localhost:9001`
++- Kafka для хоста: `localhost:29092`
+ 
+-## Важные переменные окружения
++## Pipeline и топики
+ 
+-Смотрите `.env.example`.
++| Topic | Producer | Consumer | Назначение |
++|---|---|---|---|
++| `mango.calls.raw` | mango-worker | аудит/внешние системы | Событие обнаружения звонка |
++| `calls.to_transcribe` | mango-worker | transcriber-worker | Транскрибация объекта MinIO |
++| `calls.to_analyze` | transcriber-worker | quality-worker | Анализ текста из PostgreSQL |
++| `calls.to_notify` | quality-worker | telegram-worker | Уведомление основным ботом |
++| `calls.dead_letter` | все воркеры | telegram-worker | Ошибка после трёх попыток |
+ 
+-Особенно важные:
++Топики с тремя partition создаёт одноразовый сервис `kafka-init`. Consumer offsets фиксируются только после успешной
++обработки, повторной публикации или переноса в DLQ.
+ 
+-- `MANGO_API_BASE_URL` — по умолчанию `https://app.mango-office.ru/vpbx`.
+-- `MANGO_STATS_REQUEST_ENDPOINT` — по умолчанию `stats/request`.
+-- `MANGO_STATS_RESULT_ENDPOINT` — по умолчанию `stats/result`.
+-- `MANGO_STATS_FIELDS` — поля CSV-выгрузки. Добавьте поля с recording URL/ID, если они отличаются в вашем кабинете.
+-- `MANGO_RECORDING_DOWNLOAD_ENDPOINT` — шаблон endpoint'а для скачивания записи по ID, например `records/{recording_id}`. Если Mango отдаёт прямой `recording_url`, он будет использован напрямую.
+-- `OPENAI_TRANSCRIBE_MODEL` — по умолчанию `gpt-4o-transcribe`. Можно поставить нужную вам `gpt-transcribe`-модель, если она доступна в аккаунте.
+-- `OPENAI_QUALITY_MODEL` — модель для оценки качества.
++## Данные
+ 
+-## Mango integration notes
++- `calls`: метаданные Mango, статус и путь объекта MinIO.
++- `transcriptions`: текст, модель и сырой ответ транскрибации.
++- `quality_scores`: риск, итог, ошибки, рекомендация и шесть метрик.
++- `notifications`: ключи идемпотентности отправленных Telegram-событий.
++- `worker_state`: cursor опроса Mango.
+ 
+-Клиент Mango реализован как адаптер:
++Полный результат доступен по `GET /calls/{call_id}`. `GET /health` проверяет PostgreSQL и MinIO.
+ 
+-- запросы отправляются `POST application/x-www-form-urlencoded` с полями `vpbx_api_key`, `sign`, `json`;
+-- `sign = sha256(api_key + json + api_salt)`;
+-- `stats/request` создаёт выгрузку;
+-- `stats/result` опрашивается до готовности CSV/JSON результата;
+-- CSV парсится по `MANGO_STATS_FIELDS`.
+-
+-Если ваша версия Mango отдаёт звонки вебхуками, можно добавить отдельный HTTP-ingest сервис и публиковать тот же `CallDiscoveredEvent` в `calls.to_transcribe`; downstream-воркеры менять не нужно.
+-
+-## Локальная разработка
++## Проверка
+ 
+ ```bash
+-python -m venv .venv
+-source .venv/bin/activate
+ pip install -r requirements-dev.txt
+ pytest
+ python -m compileall app
++ruff check app tests
++```
++
++`pytest` настроен с `--cov-fail-under=90`.
++
++Ручной smoke-test:
++
++```bash
++curl -fsS http://localhost:8080/health
++docker compose ps
++docker compose logs --tail=100 mango-worker transcriber-worker quality-worker telegram-worker
++docker compose exec minio mc ls --recursive local/mango-calls
++docker compose exec postgres psql -U app -d calls -c "select id,status,audio_object_name from calls order by created_at desc limit 10"
++docker compose exec postgres psql -U app -d calls -c "select call_id,left(transcript,80) from transcriptions order by created_at desc limit 10"
++docker compose exec postgres psql -U app -d calls -c "select call_id,score,risk_level from quality_scores order by created_at desc limit 10"
++docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:9092 --topic calls.dead_letter --from-beginning --max-messages 1
+ ```
+ 
+-## Производственные замечания
++Для повторного создания схемы после изменения `init.sql` удалите локальные volumes: `docker compose down -v`.
++
++## Production
+ 
+-- Для настоящего production желательно вынести миграции в Alembic, включить TLS/SASL для Kafka, секреты хранить во внешнем secret store.
+-- В Postgres лежат нормализованные индексы и статусы, в Mongo — полные сырые документы для аудита.
+-- Воркер Mango использует cursor в таблице `worker_state` и небольшой lookback, поэтому безопасен к перезапускам и частично перекрывает задержки Mango API.
+-- Идемпотентность обеспечивается `ON CONFLICT` по `call_id` и повторной проверкой наличия транскрипта/оценки.
+\ No newline at end of file
++Перед production-запуском замените стандартные пароли MinIO/PostgreSQL, включите TLS/SASL, храните секреты вне `.env`
++и перенесите SQL-схему в миграции. Для строгой атомарности PostgreSQL/Kafka рекомендуется transactional outbox.
+diff --git a/app/clients/mango.py b/app/clients/mango.py
+index dc36d7e..f2323a2 100644
+--- a/app/clients/mango.py
++++ b/app/clients/mango.py
+@@ -100,7 +100,8 @@ class MangoClient:
+ 
+     def _extract_key(self, value: Any) -> str | None:
+         if isinstance(value, dict):
+-            return value.get("key") or value.get("result", {}).get("key")
++            nested = value.get("result")
++            return value.get("key") or (nested.get("key") if isinstance(nested, dict) else None)
+         return getattr(value, "key", None)
+ 
+     def _is_result_ready(self, value: Any) -> bool:
+@@ -248,4 +249,4 @@ class MangoClient:
+     def _filename_from_response(response: httpx.Response, *, fallback: str) -> str:
+         disposition = response.headers.get("content-disposition", "")
+         match = re.search(r'filename="?([^";]+)"?', disposition)
+-        return match.group(1) if match else fallback
+\ No newline at end of file
++        return match.group(1) if match else fallback
+diff --git a/app/clients/minio.py b/app/clients/minio.py
+new file mode 100644
+index 0000000..93cbf70
+--- /dev/null
++++ b/app/clients/minio.py
+@@ -0,0 +1,51 @@
++from __future__ import annotations
++
++import asyncio
++import io
++
++from minio import Minio
++
++from app.common.config import Settings
++
++
++class MinioStorage:
++    def __init__(self, settings: Settings) -> None:
++        self.bucket = settings.minio_bucket
++        self.client = Minio(
++            settings.minio_endpoint,
++            access_key=settings.minio_access_key.get_secret_value(),
++            secret_key=settings.minio_secret_key.get_secret_value(),
++            secure=settings.minio_secure,
++        )
++
++    async def ensure_bucket(self) -> None:
++        exists = await asyncio.to_thread(self.client.bucket_exists, self.bucket)
++        if not exists:
++            await asyncio.to_thread(self.client.make_bucket, self.bucket)
++
++    async def upload(self, object_name: str, data: bytes, *, content_type: str = "audio/mpeg") -> None:
++        await self.ensure_bucket()
++        stream = io.BytesIO(data)
++        await asyncio.to_thread(
++            self.client.put_object,
++            self.bucket,
++            object_name,
++            stream,
++            len(data),
++            content_type=content_type,
++        )
++
++    async def download(self, object_name: str) -> bytes:
++        response = await asyncio.to_thread(self.client.get_object, self.bucket, object_name)
++        try:
++            return await asyncio.to_thread(response.read)
++        finally:
++            await asyncio.to_thread(response.close)
++            await asyncio.to_thread(response.release_conn)
++
++    async def is_available(self) -> bool:
++        try:
++            await asyncio.to_thread(self.client.bucket_exists, self.bucket)
++            return True
++        except Exception:
++            return False
+diff --git a/app/clients/openai_qa.py b/app/clients/openai_qa.py
+index f2c2172..31e6f4f 100644
+--- a/app/clients/openai_qa.py
++++ b/app/clients/openai_qa.py
+@@ -9,32 +9,31 @@ from app.common.config import Settings
+ from app.common.models import QualityResult
+ from app.prompts.quality import QUALITY_SYSTEM_PROMPT, build_quality_user_prompt
+ 
++CRITERIA_PROPERTIES = {
++    name: {"type": "integer", "minimum": 0, "maximum": 100}
++    for name in ("greeting", "needs_discovery", "urgency", "target_action", "objection_handling", "closing")
++}
++
+ QUALITY_JSON_SCHEMA: dict[str, Any] = {
+-    "name": "call_quality_score",
++    "name": "call_analysis",
+     "strict": True,
+     "schema": {
+         "type": "object",
+         "properties": {
+             "score": {"type": "integer", "minimum": 0, "maximum": 100},
++            "risk_level": {"type": "string", "enum": ["critical", "warning", "normal"]},
++            "risk_reason": {"type": "string"},
+             "summary": {"type": "string"},
+-            "positives": {"type": "array", "items": {"type": "string"}},
+-            "negatives": {"type": "array", "items": {"type": "string"}},
+-            "recommendations": {"type": "array", "items": {"type": "string"}},
++            "errors": {"type": "array", "items": {"type": "string"}},
++            "recommendation": {"type": "string"},
+             "criteria": {
+                 "type": "object",
+-                "properties": {
+-                    "greeting": {"type": "integer", "minimum": 0, "maximum": 100},
+-                    "needs_discovery": {"type": "integer", "minimum": 0, "maximum": 100},
+-                    "clarity": {"type": "integer", "minimum": 0, "maximum": 100},
+-                    "empathy": {"type": "integer", "minimum": 0, "maximum": 100},
+-                    "resolution": {"type": "integer", "minimum": 0, "maximum": 100},
+-                    "compliance": {"type": "integer", "minimum": 0, "maximum": 100},
+-                },
+-                "required": ["greeting", "needs_discovery", "clarity", "empathy", "resolution", "compliance"],
++                "properties": CRITERIA_PROPERTIES,
++                "required": list(CRITERIA_PROPERTIES),
+                 "additionalProperties": False,
+             },
+         },
+-        "required": ["score", "summary", "positives", "negatives", "recommendations", "criteria"],
++        "required": ["score", "risk_level", "risk_reason", "summary", "errors", "recommendation", "criteria"],
+         "additionalProperties": False,
+     },
+ }
+@@ -42,19 +41,33 @@ QUALITY_JSON_SCHEMA: dict[str, Any] = {
+ 
+ class OpenAIQaClient:
+     def __init__(self, settings: Settings) -> None:
+-        api_key = settings.openai_api_key.get_secret_value()
+-        self.client = AsyncOpenAI(api_key=api_key or None)
++        api_key = settings.openrouter_api_key.get_secret_value()
++        headers = {"X-Title": settings.openrouter_app_name}
++        if settings.openrouter_http_referer:
++            headers["HTTP-Referer"] = settings.openrouter_http_referer
++        self.client = AsyncOpenAI(
++            api_key=api_key or None,
++            base_url=settings.openrouter_base_url,
++            default_headers=headers,
++        )
+         self.transcribe_model = settings.openai_transcribe_model
+         self.quality_model = settings.openai_quality_model
+         self.quality_temperature = settings.openai_quality_temperature
+ 
++    async def aclose(self) -> None:
++        await self.client.close()
++
+     async def transcribe(self, *, audio: bytes, filename: str) -> tuple[str, dict[str, Any]]:
+         result = await self.client.audio.transcriptions.create(
+             model=self.transcribe_model,
+             file=(filename, audio),
+             response_format="json",
+         )
+-        raw = result.model_dump(mode="json") if hasattr(result, "model_dump") else {"text": str(result)}
++        raw = (
++            result.model_dump(mode="json")
++            if hasattr(result, "model_dump")
++            else {"text": str(getattr(result, "text", result))}
++        )
+         text = raw.get("text") or getattr(result, "text", "")
+         return str(text), raw
+ 
+@@ -69,7 +82,6 @@ class OpenAIQaClient:
+             response_format={"type": "json_schema", "json_schema": QUALITY_JSON_SCHEMA},
+         )
+         content = completion.choices[0].message.content or "{}"
+-        parsed = json.loads(content)
+-        quality = QualityResult.model_validate(parsed)
++        quality = QualityResult.model_validate(json.loads(content))
+         raw = completion.model_dump(mode="json") if hasattr(completion, "model_dump") else {"content": content}
+-        return quality, raw
+\ No newline at end of file
++        return quality, raw
+diff --git a/app/clients/telegram.py b/app/clients/telegram.py
+new file mode 100644
+index 0000000..773d78b
+--- /dev/null
++++ b/app/clients/telegram.py
+@@ -0,0 +1,33 @@
++from __future__ import annotations
++
++import httpx
++
++from app.common.config import Settings
++
++
++class TelegramClient:
++    def __init__(self, settings: Settings) -> None:
++        self.base_url = settings.telegram_api_base_url.rstrip("/")
++        self.main_token = settings.telegram_bot_token.get_secret_value()
++        self.main_chat_id = settings.telegram_chat_id
++        self.error_token = settings.telegram_error_bot_token.get_secret_value()
++        self.error_chat_id = settings.telegram_error_chat_id
++        self.http = httpx.AsyncClient(timeout=30)
++
++    async def aclose(self) -> None:
++        await self.http.aclose()
++
++    async def send(self, text: str, *, error_channel: bool = False) -> None:
++        token = self.error_token if error_channel else self.main_token
++        chat_id = self.error_chat_id if error_channel else self.main_chat_id
++        if not token or not chat_id:
++            channel = "error" if error_channel else "main"
++            raise RuntimeError(f"Telegram {channel} bot token/chat id are not configured")
++        response = await self.http.post(
++            f"{self.base_url}/bot{token}/sendMessage",
++            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
++        )
++        response.raise_for_status()
++        payload = response.json()
++        if not payload.get("ok"):
++            raise RuntimeError(f"Telegram API rejected message: {payload}")
+diff --git a/app/common/__main__.py b/app/common/__main__.py
+index 4e9902f..daffb07 100644
+--- a/app/common/__main__.py
++++ b/app/common/__main__.py
+@@ -1 +1 @@
+-print("Use one of: python -m app.services.api | mango_worker | transcriber_worker | quality_worker")
+\ No newline at end of file
++print("Use one of: python -m app.services.api | mango_worker | transcriber_worker | quality_worker | telegram_worker")
+diff --git a/app/common/config.py b/app/common/config.py
+index 6412022..56fa567 100644
+--- a/app/common/config.py
++++ b/app/common/config.py
+@@ -14,14 +14,23 @@ class Settings(BaseSettings):
+     log_level: str = "INFO"
+ 
+     postgres_dsn: str = "postgresql://app:app@postgres:5432/calls"
+-    mongo_dsn: str = "mongodb://mongo:27017"
+-    mongo_database: str = "mango_calls"
+     kafka_bootstrap_servers: str = "kafka:9092"
+     kafka_group_prefix: str = "mango-calls-local"
++    retry_max_attempts: int = Field(default=3, ge=1)
++    retry_backoff_seconds: float = Field(default=2.0, ge=0)
+ 
+-    openai_api_key: SecretStr = Field(default=SecretStr(""))
+-    openai_transcribe_model: str = "gpt-4o-transcribe"
+-    openai_quality_model: str = "gpt-4o-mini"
++    minio_endpoint: str = "minio:9000"
++    minio_access_key: SecretStr = Field(default=SecretStr("minioadmin"))
++    minio_secret_key: SecretStr = Field(default=SecretStr("minioadmin"))
++    minio_bucket: str = "mango-calls"
++    minio_secure: bool = False
++
++    openrouter_api_key: SecretStr = Field(default=SecretStr(""))
++    openrouter_base_url: str = "https://openrouter.ai/api/v1"
++    openrouter_http_referer: str | None = None
++    openrouter_app_name: str = "Mango Transcribe Analysis"
++    openai_transcribe_model: str = "openai/gpt-4o-transcribe"
++    openai_quality_model: str = "openai/gpt-4o-mini"
+     openai_quality_temperature: float = 0.0
+ 
+     mango_api_base_url: str = "https://app.mango-office.ru/vpbx"
+@@ -35,15 +44,23 @@ class Settings(BaseSettings):
+     mango_request_window_seconds: int = 300
+     mango_result_poll_attempts: int = 12
+     mango_result_poll_interval_seconds: int = 5
++    mango_worker_concurrency: int = Field(default=4, ge=1)
+     mango_stats_fields: Annotated[str, Field(description="Comma-separated Mango stats fields")] = (
+         "records,start,finish,from_extension,from_number,to_extension,to_number,disconnect_reason"
+     )
+     mango_default_timezone: str = "Europe/Moscow"
+ 
++    telegram_bot_token: SecretStr = Field(default=SecretStr(""))
++    telegram_chat_id: str = ""
++    telegram_error_bot_token: SecretStr = Field(default=SecretStr(""))
++    telegram_error_chat_id: str = ""
++    telegram_api_base_url: str = "https://api.telegram.org"
++    dashboard_base_url: str = "https://ainakontrole.ru/app/dashboard"
++
+     topic_mango_raw: str = "mango.calls.raw"
+     topic_to_transcribe: str = "calls.to_transcribe"
+-    topic_transcribed: str = "calls.transcribed"
+-    topic_quality: str = "calls.quality"
++    topic_to_analyze: str = "calls.to_analyze"
++    topic_to_notify: str = "calls.to_notify"
+     topic_dead_letter: str = "calls.dead_letter"
+ 
+     api_host: str = "0.0.0.0"
+@@ -56,4 +73,4 @@ class Settings(BaseSettings):
+ 
+ @lru_cache(maxsize=1)
+ def get_settings() -> Settings:
+-    return Settings()
+\ No newline at end of file
++    return Settings()
+diff --git a/app/common/db.py b/app/common/db.py
+index 86835d3..b6bb8ff 100644
+--- a/app/common/db.py
++++ b/app/common/db.py
+@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator
+ from contextlib import asynccontextmanager
+ 
+ import asyncpg
+-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+ 
+ from app.common.config import Settings
+ 
+@@ -16,12 +15,3 @@ async def postgres_pool(settings: Settings) -> AsyncIterator[asyncpg.Pool]:
+         yield pool
+     finally:
+         await pool.close()
+-
+-
+-@asynccontextmanager
+-async def mongo_db(settings: Settings) -> AsyncIterator[AsyncIOMotorDatabase]:
+-    client: AsyncIOMotorClient = AsyncIOMotorClient(settings.mongo_dsn)
+-    try:
+-        yield client[settings.mongo_database]
+-    finally:
+-        client.close()
+\ No newline at end of file
+diff --git a/app/common/formatting.py b/app/common/formatting.py
+new file mode 100644
+index 0000000..c2cb70f
+--- /dev/null
++++ b/app/common/formatting.py
+@@ -0,0 +1,104 @@
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Any
++from urllib.parse import urlencode
++
++from app.common.models import QualityCriteria, QualityResult
++
++SEPARATOR = "━━━━━━━━━━━━"
++
++
++def _duration(call: dict[str, Any]) -> str:
++    try:
++        start = datetime.fromisoformat(str(call["started_at"]).replace("Z", "+00:00"))
++        finish = datetime.fromisoformat(str(call["finished_at"]).replace("Z", "+00:00"))
++        seconds = max(0, int((finish - start).total_seconds()))
++        return f"{seconds // 60}:{seconds % 60:02d}"
++    except (KeyError, TypeError, ValueError):
++        return "-"
++
++
++def _date(call: dict[str, Any]) -> tuple[str, str]:
++    try:
++        value = datetime.fromisoformat(str(call["started_at"]).replace("Z", "+00:00"))
++        return value.strftime("%d.%m.%Y %H:%M"), value.strftime("%Y-%m-%d")
++    except (KeyError, TypeError, ValueError):
++        return "-", datetime.now().strftime("%Y-%m-%d")
++
++
++def _manager(call: dict[str, Any]) -> str:
++    raw = call.get("raw") or {}
++    return str(raw.get("manager_name") or raw.get("user_name") or raw.get("from_extension") or "-")
++
++
++def _deal(call: dict[str, Any]) -> str:
++    raw = call.get("raw") or {}
++    return str(raw.get("deal_id") or raw.get("crm_deal_id") or "-")
++
++
++def _criteria_line(criteria: QualityCriteria) -> str:
++    return (
++        f"👋{criteria.greeting} · 🔍{criteria.needs_discovery} · 🔥{criteria.urgency} · "
++        f"🎯{criteria.target_action} · 🛡{criteria.objection_handling} · 🏁{criteria.closing}"
++    )
++
++
++def format_analysis_message(
++    call: dict[str, Any], quality: QualityResult, dashboard_base_url: str
++) -> str:
++    title = (
++        "🚨 РИСК СРЫВА СДЕЛКИ"
++        if quality.risk_level == "critical"
++        else "📞 АНАЛИЗ ЗВОНКА"
++    )
++    started, query_date = _date(call)
++    query = urlencode({"start": query_date, "end": query_date, "funnel": "sales", "callId": call["id"]})
++    dashboard_url = f"{dashboard_base_url}?{query}"
++    errors = "; ".join(quality.errors) if quality.errors else "Критичных ошибок не выявлено"
++    return "\n".join(
++        [
++            title,
++            "",
++            f"👤 {_manager(call)} · {call.get('direction') or '-'} · {call.get('from_number') or '-'}",
++            f"📅 {started} · {_duration(call)}",
++            f"🔗 Сделка: {_deal(call)}",
++            f"🎧 Звонок: {call.get('recording_url') or '-'}",
++            "",
++            SEPARATOR,
++            "",
++            f"⚠️ Почему риск: {quality.risk_reason}",
++            "",
++            f"💬 Итог: {quality.summary}",
++            "",
++            f"❌ Ошибки: {errors}",
++            "",
++            SEPARATOR,
++            "",
++            f"📊 Оценка: {quality.score}",
++            "",
++            _criteria_line(quality.criteria),
++            "",
++            SEPARATOR,
++            "",
++            "✅ Что делать:",
++            quality.recommendation,
++            "",
++            f"🌐 Подробнее: {dashboard_url}",
++        ]
++    )
++
++
++def format_dead_letter_message(payload: dict[str, Any]) -> str:
++    task = payload.get("payload") or {}
++    return "\n".join(
++        [
++            "❗ ОШИБКА ОБРАБОТКИ ЗВОНКА",
++            "",
++            f"Сервис: {payload.get('service', '-')}",
++            f"Очередь: {payload.get('source_topic', '-')}",
++            f"Звонок: {task.get('call_id', '-')}",
++            f"Попыток: {payload.get('attempts', '-')}",
++            f"Ошибка: {payload.get('error', '-')}",
++        ]
++    )
+diff --git a/app/common/kafka.py b/app/common/kafka.py
+index 4c39cca..a901d06 100644
+--- a/app/common/kafka.py
++++ b/app/common/kafka.py
+@@ -33,11 +33,12 @@ async def kafka_producer(settings: Settings) -> AsyncIterator[AIOKafkaProducer]:
+ async def kafka_consumer(
+     settings: Settings,
+     *,
+-    topic: str,
++    topic: str | tuple[str, ...],
+     group_suffix: str,
+ ) -> AsyncIterator[AIOKafkaConsumer]:
++    topics = (topic,) if isinstance(topic, str) else topic
+     consumer = AIOKafkaConsumer(
+-        topic,
++        *topics,
+         bootstrap_servers=settings.kafka_bootstrap_servers,
+         group_id=f"{settings.kafka_group_prefix}-{group_suffix}",
+         enable_auto_commit=False,
+@@ -68,4 +69,4 @@ async def commit_after(record: ConsumerRecord, consumer: AIOKafkaConsumer) -> No
+     logger.debug(
+         "committed kafka message",
+         extra={"topic": record.topic, "partition": record.partition, "offset": record.offset},
+-    )
+\ No newline at end of file
++    )
+diff --git a/app/common/models.py b/app/common/models.py
+index 0d139d7..d8acc03 100644
+--- a/app/common/models.py
++++ b/app/common/models.py
+@@ -35,30 +35,30 @@ class BaseEvent(BaseModel):
+     occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+ 
+ 
++class TaskEvent(BaseEvent):
++    attempt: int = Field(default=1, ge=1)
++
++
+ class CallDiscoveredEvent(BaseEvent):
+     event_type: Literal["call.discovered"] = "call.discovered"
+     call: CallRecord
+ 
+ 
+-class TranscriptionRequestedEvent(BaseEvent):
++class TranscriptionRequestedEvent(TaskEvent):
+     event_type: Literal["transcription.requested"] = "transcription.requested"
+     call_id: str
+-    recording_id: str | None = None
+-    recording_url: str | None = None
++    object_name: str
++    filename: str
+ 
+ 
+-class CallTranscribedEvent(BaseEvent):
+-    event_type: Literal["call.transcribed"] = "call.transcribed"
++class AnalysisRequestedEvent(TaskEvent):
++    event_type: Literal["analysis.requested"] = "analysis.requested"
+     call_id: str
+-    transcript_chars: int
+-    model: str
+ 
+ 
+-class QualityScoredEvent(BaseEvent):
+-    event_type: Literal["call.quality_scored"] = "call.quality_scored"
++class NotificationRequestedEvent(TaskEvent):
++    event_type: Literal["notification.requested"] = "notification.requested"
+     call_id: str
+-    score: int
+-    model: str
+ 
+ 
+ class DeadLetterEvent(BaseEvent):
+@@ -67,12 +67,23 @@ class DeadLetterEvent(BaseEvent):
+     payload: dict[str, Any]
+     error: str
+     service: str
++    attempts: int
++
++
++class QualityCriteria(BaseModel):
++    greeting: int = Field(ge=0, le=100)
++    needs_discovery: int = Field(ge=0, le=100)
++    urgency: int = Field(ge=0, le=100)
++    target_action: int = Field(ge=0, le=100)
++    objection_handling: int = Field(ge=0, le=100)
++    closing: int = Field(ge=0, le=100)
+ 
+ 
+ class QualityResult(BaseModel):
+     score: int = Field(ge=0, le=100)
++    risk_level: Literal["critical", "warning", "normal"]
++    risk_reason: str
+     summary: str
+-    positives: list[str] = Field(default_factory=list)
+-    negatives: list[str] = Field(default_factory=list)
+-    recommendations: list[str] = Field(default_factory=list)
+-    criteria: dict[str, int] = Field(default_factory=dict)
+\ No newline at end of file
++    errors: list[str] = Field(default_factory=list)
++    recommendation: str
++    criteria: QualityCriteria
+diff --git a/app/common/repository.py b/app/common/repository.py
+index 449d96e..0fa3834 100644
+--- a/app/common/repository.py
++++ b/app/common/repository.py
+@@ -1,11 +1,10 @@
+ from __future__ import annotations
+ 
+-from datetime import datetime, timezone
++from datetime import datetime
+ from decimal import Decimal
+ from typing import Any
+ 
+ import asyncpg
+-from motor.motor_asyncio import AsyncIOMotorDatabase
+ 
+ from app.common.models import CallRecord, QualityResult
+ from app.common.serialization import json_dumps_bytes
+@@ -21,25 +20,33 @@ def _to_primitive(value: Any) -> Any:
+     if isinstance(value, datetime):
+         return value.isoformat()
+     if isinstance(value, dict):
+-        return {k: _to_primitive(v) for k, v in value.items()}
++        return {key: _to_primitive(item) for key, item in value.items()}
+     if isinstance(value, list):
+-        return [_to_primitive(v) for v in value]
++        return [_to_primitive(item) for item in value]
+     return value
+ 
+ 
+ class Repository:
+-    def __init__(self, pg: asyncpg.Pool, mongo: AsyncIOMotorDatabase) -> None:
++    def __init__(self, pg: asyncpg.Pool) -> None:
+         self.pg = pg
+-        self.mongo = mongo
+ 
+-    async def save_call(self, call: CallRecord, *, status: str = "discovered") -> None:
++    async def save_call(
++        self,
++        call: CallRecord,
++        *,
++        status: str = "discovered",
++        audio_bucket: str | None = None,
++        audio_object_name: str | None = None,
++        audio_filename: str | None = None,
++    ) -> None:
+         async with self.pg.acquire() as conn:
+             await conn.execute(
+                 """
+                 INSERT INTO calls (
+                     id, entry_id, call_id, recording_id, recording_url, direction,
+-                    from_number, to_number, started_at, finished_at, disconnect_reason, raw, status
+-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)
++                    from_number, to_number, started_at, finished_at, disconnect_reason, raw, status,
++                    audio_bucket, audio_object_name, audio_filename
++                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16)
+                 ON CONFLICT (id) DO UPDATE SET
+                     entry_id = EXCLUDED.entry_id,
+                     call_id = EXCLUDED.call_id,
+@@ -52,10 +59,14 @@ class Repository:
+                     finished_at = COALESCE(EXCLUDED.finished_at, calls.finished_at),
+                     disconnect_reason = COALESCE(EXCLUDED.disconnect_reason, calls.disconnect_reason),
+                     raw = calls.raw || EXCLUDED.raw,
++                    audio_bucket = COALESCE(EXCLUDED.audio_bucket, calls.audio_bucket),
++                    audio_object_name = COALESCE(EXCLUDED.audio_object_name, calls.audio_object_name),
++                    audio_filename = COALESCE(EXCLUDED.audio_filename, calls.audio_filename),
+                     status = CASE
+-                        WHEN calls.status IN ('transcribed', 'quality_scored') THEN calls.status
++                        WHEN calls.status IN ('recorded', 'transcribed', 'analyzed', 'notified') THEN calls.status
+                         ELSE EXCLUDED.status
+-                    END
++                    END,
++                    error = NULL
+                 """,
+                 call.id,
+                 call.entry_id,
+@@ -70,50 +81,27 @@ class Repository:
+                 call.disconnect_reason,
+                 _json(call.raw),
+                 status,
++                audio_bucket,
++                audio_object_name,
++                audio_filename,
+             )
+-        await self.mongo.calls_raw.update_one(
+-            {"_id": call.id},
+-            {
+-                "$set": {
+-                    **call.model_dump(mode="json"),
+-                    "status": status,
+-                    "updated_at": datetime.now(timezone.utc).isoformat(),
+-                },
+-                "$setOnInsert": {"created_at": datetime.now(timezone.utc).isoformat()},
+-            },
+-            upsert=True,
+-        )
+ 
+     async def mark_call_status(self, call_id: str, status: str, error: str | None = None) -> None:
+         async with self.pg.acquire() as conn:
+             await conn.execute("UPDATE calls SET status=$2, error=$3 WHERE id=$1", call_id, status, error)
+-        await self.mongo.calls_raw.update_one(
+-            {"_id": call_id},
+-            {"$set": {"status": status, "error": error, "updated_at": datetime.now(timezone.utc).isoformat()}},
+-            upsert=False,
+-        )
+ 
+     async def get_call(self, call_id: str) -> dict[str, Any] | None:
+         async with self.pg.acquire() as conn:
+             row = await conn.fetchrow("SELECT * FROM calls WHERE id=$1", call_id)
+-        return dict(row) if row else None
++        return _to_primitive(dict(row)) if row else None
+ 
+     async def get_call_with_results(self, call_id: str) -> dict[str, Any] | None:
+         async with self.pg.acquire() as conn:
+             row = await conn.fetchrow(
+                 """
+-                SELECT
+-                    c.*,
+-                    t.transcript,
+-                    t.model AS transcription_model,
+-                    t.language AS transcription_language,
+-                    q.score,
+-                    q.summary,
+-                    q.positives,
+-                    q.negatives,
+-                    q.recommendations,
+-                    q.criteria,
+-                    q.model AS quality_model
++                SELECT c.*, t.transcript, t.model AS transcription_model,
++                    t.language AS transcription_language, q.score, q.risk_level, q.risk_reason,
++                    q.summary, q.errors, q.recommendation, q.criteria, q.model AS quality_model
+                 FROM calls c
+                 LEFT JOIN transcriptions t ON t.call_id = c.id
+                 LEFT JOIN quality_scores q ON q.call_id = c.id
+@@ -134,47 +122,28 @@ class Repository:
+         duration_seconds: float | None = None,
+     ) -> None:
+         async with self.pg.acquire() as conn:
+-            await conn.execute(
+-                """
+-                INSERT INTO transcriptions (call_id, transcript, model, language, duration_seconds, raw)
+-                VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+-                ON CONFLICT (call_id) DO UPDATE SET
+-                    transcript = EXCLUDED.transcript,
+-                    model = EXCLUDED.model,
+-                    language = EXCLUDED.language,
+-                    duration_seconds = EXCLUDED.duration_seconds,
+-                    raw = EXCLUDED.raw,
+-                    created_at = now()
+-                """,
+-                call_id,
+-                transcript,
+-                model,
+-                language,
+-                duration_seconds,
+-                _json(raw or {}),
+-            )
+-        await self.mark_call_status(call_id, "transcribed")
+-        await self.mongo.transcriptions.update_one(
+-            {"_id": call_id},
+-            {
+-                "$set": {
+-                    "call_id": call_id,
+-                    "transcript": transcript,
+-                    "model": model,
+-                    "language": language,
+-                    "duration_seconds": duration_seconds,
+-                    "raw": raw or {},
+-                    "updated_at": datetime.now(timezone.utc).isoformat(),
+-                },
+-                "$setOnInsert": {"created_at": datetime.now(timezone.utc).isoformat()},
+-            },
+-            upsert=True,
+-        )
++            async with conn.transaction():
++                await conn.execute(
++                    """
++                    INSERT INTO transcriptions (call_id, transcript, model, language, duration_seconds, raw)
++                    VALUES ($1,$2,$3,$4,$5,$6::jsonb)
++                    ON CONFLICT (call_id) DO UPDATE SET transcript=EXCLUDED.transcript, model=EXCLUDED.model,
++                        language=EXCLUDED.language, duration_seconds=EXCLUDED.duration_seconds,
++                        raw=EXCLUDED.raw, created_at=now()
++                    """,
++                    call_id,
++                    transcript,
++                    model,
++                    language,
++                    duration_seconds,
++                    _json(raw or {}),
++                )
++                await conn.execute("UPDATE calls SET status='transcribed', error=NULL WHERE id=$1", call_id)
+ 
+     async def transcription_exists(self, call_id: str) -> bool:
+         async with self.pg.acquire() as conn:
+-            exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM transcriptions WHERE call_id=$1)", call_id)
+-        return bool(exists)
++            value = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM transcriptions WHERE call_id=$1)", call_id)
++        return bool(value)
+ 
+     async def get_transcription(self, call_id: str) -> str | None:
+         async with self.pg.acquire() as conn:
+@@ -182,8 +151,8 @@ class Repository:
+ 
+     async def quality_exists(self, call_id: str) -> bool:
+         async with self.pg.acquire() as conn:
+-            exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM quality_scores WHERE call_id=$1)", call_id)
+-        return bool(exists)
++            value = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM quality_scores WHERE call_id=$1)", call_id)
++        return bool(value)
+ 
+     async def save_quality(
+         self,
+@@ -194,47 +163,60 @@ class Repository:
+         raw: dict[str, Any] | None = None,
+     ) -> None:
+         async with self.pg.acquire() as conn:
+-            await conn.execute(
++            async with conn.transaction():
++                await conn.execute(
++                    """
++                    INSERT INTO quality_scores (
++                        call_id, score, risk_level, risk_reason, summary, errors,
++                        recommendation, criteria, raw, model
++                    ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8::jsonb,$9::jsonb,$10)
++                    ON CONFLICT (call_id) DO UPDATE SET score=EXCLUDED.score,
++                        risk_level=EXCLUDED.risk_level, risk_reason=EXCLUDED.risk_reason,
++                        summary=EXCLUDED.summary, errors=EXCLUDED.errors,
++                        recommendation=EXCLUDED.recommendation, criteria=EXCLUDED.criteria,
++                        raw=EXCLUDED.raw, model=EXCLUDED.model, created_at=now()
++                    """,
++                    call_id,
++                    quality.score,
++                    quality.risk_level,
++                    quality.risk_reason,
++                    quality.summary,
++                    _json(quality.errors),
++                    quality.recommendation,
++                    _json(quality.criteria.model_dump(mode="json")),
++                    _json(raw or quality.model_dump(mode="json")),
++                    model,
++                )
++                await conn.execute("UPDATE calls SET status='analyzed', error=NULL WHERE id=$1", call_id)
++
++    async def notification_exists(
++        self, event_id: str, call_id: str | None = None, channel: str | None = None
++    ) -> bool:
++        async with self.pg.acquire() as conn:
++            value = await conn.fetchval(
+                 """
+-                INSERT INTO quality_scores (
+-                    call_id, score, summary, positives, negatives, recommendations, criteria, raw, model
+-                ) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9)
+-                ON CONFLICT (call_id) DO UPDATE SET
+-                    score = EXCLUDED.score,
+-                    summary = EXCLUDED.summary,
+-                    positives = EXCLUDED.positives,
+-                    negatives = EXCLUDED.negatives,
+-                    recommendations = EXCLUDED.recommendations,
+-                    criteria = EXCLUDED.criteria,
+-                    raw = EXCLUDED.raw,
+-                    model = EXCLUDED.model,
+-                    created_at = now()
++                SELECT EXISTS(
++                    SELECT 1 FROM notifications
++                    WHERE event_id=$1 OR ($2::text IS NOT NULL AND call_id=$2 AND channel=$3)
++                )
+                 """,
++                event_id,
+                 call_id,
+-                quality.score,
+-                quality.summary,
+-                _json(quality.positives),
+-                _json(quality.negatives),
+-                _json(quality.recommendations),
+-                _json(quality.criteria),
+-                _json(raw or quality.model_dump(mode="json")),
+-                model,
++                channel,
+             )
+-        await self.mark_call_status(call_id, "quality_scored")
+-        await self.mongo.quality_scores.update_one(
+-            {"_id": call_id},
+-            {
+-                "$set": {
+-                    "call_id": call_id,
+-                    **quality.model_dump(mode="json"),
+-                    "model": model,
+-                    "raw": raw or quality.model_dump(mode="json"),
+-                    "updated_at": datetime.now(timezone.utc).isoformat(),
+-                },
+-                "$setOnInsert": {"created_at": datetime.now(timezone.utc).isoformat()},
+-            },
+-            upsert=True,
+-        )
++        return bool(value)
++
++    async def save_notification(self, event_id: str, call_id: str | None, channel: str) -> None:
++        async with self.pg.acquire() as conn:
++            async with conn.transaction():
++                await conn.execute(
++                    "INSERT INTO notifications (event_id, call_id, channel) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
++                    event_id,
++                    call_id,
++                    channel,
++                )
++                if call_id and channel == "main":
++                    await conn.execute("UPDATE calls SET status='notified', error=NULL WHERE id=$1", call_id)
+ 
+     async def get_state(self, name: str) -> dict[str, Any] | None:
+         async with self.pg.acquire() as conn:
+@@ -245,10 +227,9 @@ class Repository:
+         async with self.pg.acquire() as conn:
+             await conn.execute(
+                 """
+-                INSERT INTO worker_state (name, value)
+-                VALUES ($1, $2::jsonb)
++                INSERT INTO worker_state (name, value) VALUES ($1, $2::jsonb)
+                 ON CONFLICT (name) DO UPDATE SET value=EXCLUDED.value, updated_at=now()
+                 """,
+                 name,
+                 _json(value),
+-            )
+\ No newline at end of file
++            )
+diff --git a/app/common/retry.py b/app/common/retry.py
+new file mode 100644
+index 0000000..8d43e46
+--- /dev/null
++++ b/app/common/retry.py
+@@ -0,0 +1,44 @@
++from __future__ import annotations
++
++import asyncio
++from typing import Any
++
++from app.common.models import DeadLetterEvent
++
++
++async def retry_or_dead_letter(
++    *,
++    producer: Any,
++    settings: Any,
++    source_topic: str,
++    payload: dict[str, Any],
++    error: Exception,
++    service: str,
++) -> bool:
++    """Republish a failed task, or send it to DLQ after the final attempt.
++
++    Returns True when the task was moved to DLQ and False when it was scheduled for retry.
++    """
++    from app.common.kafka import publish_json
++
++    try:
++        attempt = max(1, int(payload.get("attempt", 1)))
++    except (TypeError, ValueError):
++        attempt = 1
++    key = payload.get("call_id")
++    if attempt < settings.retry_max_attempts:
++        retry_payload = {**payload, "attempt": attempt + 1}
++        if settings.retry_backoff_seconds:
++            await asyncio.sleep(settings.retry_backoff_seconds)
++        await publish_json(producer, source_topic, retry_payload, key=key)
++        return False
++
++    event = DeadLetterEvent(
++        source_topic=source_topic,
++        payload=payload,
++        error=str(error),
++        service=service,
++        attempts=attempt,
++    )
++    await publish_json(producer, settings.topic_dead_letter, event.model_dump(mode="json"), key=key)
++    return True
+diff --git a/app/prompts/quality.py b/app/prompts/quality.py
+index 9c3e65f..6a476e5 100644
+--- a/app/prompts/quality.py
++++ b/app/prompts/quality.py
+@@ -1,24 +1,20 @@
+-QUALITY_SYSTEM_PROMPT = """Ты строгий, но полезный QA-аналитик контакт-центра.
+-Оцени качество разговора по транскрипту. Учитывай только то, что явно видно в тексте.
+-Не придумывай факты, которых нет в транскрипте.
+-Верни строго JSON по заданной схеме.
++QUALITY_SYSTEM_PROMPT = """Ты строгий QA-аналитик отдела продаж.
++Анализируй только факты из транскрипта и верни JSON.
+ 
+-Критерии:
+-- greeting: корректное приветствие и представление;
+-- needs_discovery: выявление потребности клиента;
+-- clarity: понятность и структурность речи;
+-- empathy: вежливость и эмпатия;
+-- resolution: доведение до результата/следующего шага;
+-- compliance: отсутствие рискованных обещаний, грубости, раскрытия лишних данных.
++Считай звонок critical, если сделка рискует сорваться: клиент ушел "подумать",
++возражение не раскрыто, следующий шаг не согласован или менеджер завершил
++разговор без конкретного действия. Для critical обязательно кратко объясни риск.
++Для warning укажи заметные недочеты без явного риска срыва.
++Для normal не выдумывай риск.
+ 
+-score — общий балл от 0 до 100.
+-criteria — баллы по каждому критерию от 0 до 100.
++Критерии (0-100): greeting — приветствие; needs_discovery — выявление
++потребностей; urgency — создание мотивации действовать; target_action — движение
++к целевому действию; objection_handling — работа с возражениями; closing — резюме
++и зафиксированный следующий шаг. Общая score должна быть согласована с критериями.
++Пиши summary, risk_reason, errors и recommendation кратко, по-русски,
++без Markdown и без персональных данных.
+ """
+ 
+ 
+ def build_quality_user_prompt(transcript: str) -> str:
+-    return f"""Оцени следующий транскрипт звонка.
+-
+-Транскрипт:
+-{transcript}
+-"""
+\ No newline at end of file
++    return f"Проанализируй транскрипт звонка:\n\n{transcript}"
+diff --git a/app/services/api.py b/app/services/api.py
+index 9c325c5..6550fde 100644
+--- a/app/services/api.py
++++ b/app/services/api.py
+@@ -1,19 +1,17 @@
+ from __future__ import annotations
+ 
+-import logging
+ from contextlib import asynccontextmanager
+ from typing import Any
+ 
+ import asyncpg
+ import uvicorn
+ from fastapi import FastAPI, HTTPException
+-from motor.motor_asyncio import AsyncIOMotorClient
+ 
++from app.clients.minio import MinioStorage
+ from app.common.config import Settings, get_settings
+ from app.common.logging import configure_logging
+ from app.common.repository import Repository
+ 
+-logger = logging.getLogger(__name__)
+ settings = get_settings()
+ configure_logging(settings.log_level)
+ 
+@@ -21,19 +19,16 @@ configure_logging(settings.log_level)
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
+     pg = await asyncpg.create_pool(dsn=settings.postgres_dsn, min_size=1, max_size=10)
+-    mongo_client: AsyncIOMotorClient = AsyncIOMotorClient(settings.mongo_dsn)
+     app.state.pg = pg
+-    app.state.mongo_client = mongo_client
+-    app.state.mongo = mongo_client[settings.mongo_database]
+-    app.state.repo = Repository(pg, app.state.mongo)
++    app.state.repo = Repository(pg)
++    app.state.storage = MinioStorage(settings)
+     try:
+         yield
+     finally:
+         await pg.close()
+-        mongo_client.close()
+ 
+ 
+-app = FastAPI(title="Mango Calls QA", version="1.0.0", lifespan=lifespan)
++app = FastAPI(title="Mango Transcribe Analysis", version="2.0.0", lifespan=lifespan)
+ 
+ 
+ @app.get("/health")
+@@ -41,14 +36,17 @@ async def health() -> dict[str, Any]:
+     repo: Repository = app.state.repo
+     async with repo.pg.acquire() as conn:
+         pg_ok = await conn.fetchval("SELECT 1")
+-    mongo_ok = await app.state.mongo.command("ping")
+-    return {"status": "ok", "postgres": pg_ok == 1, "mongo": bool(mongo_ok.get("ok"))}
++    minio_ok = await app.state.storage.is_available()
++    return {
++        "status": "ok" if pg_ok == 1 and minio_ok else "degraded",
++        "postgres": pg_ok == 1,
++        "minio": minio_ok,
++    }
+ 
+ 
+ @app.get("/calls/{call_id}")
+ async def get_call(call_id: str) -> dict[str, Any]:
+-    repo: Repository = app.state.repo
+-    data = await repo.get_call_with_results(call_id)
++    data = await app.state.repo.get_call_with_results(call_id)
+     if not data:
+         raise HTTPException(status_code=404, detail="call not found")
+     return data
+@@ -60,11 +58,11 @@ async def topics() -> dict[str, str]:
+     return {
+         "mango_raw": s.topic_mango_raw,
+         "to_transcribe": s.topic_to_transcribe,
+-        "transcribed": s.topic_transcribed,
+-        "quality": s.topic_quality,
++        "to_analyze": s.topic_to_analyze,
++        "to_notify": s.topic_to_notify,
+         "dead_letter": s.topic_dead_letter,
+     }
+ 
+ 
+ if __name__ == "__main__":
+-    uvicorn.run("app.services.api:app", host=settings.api_host, port=settings.api_port, reload=False)
+\ No newline at end of file
++    uvicorn.run("app.services.api:app", host=settings.api_host, port=settings.api_port, reload=False)
+diff --git a/app/services/mango_worker.py b/app/services/mango_worker.py
+index 042ee43..91ad2a0 100644
+--- a/app/services/mango_worker.py
++++ b/app/services/mango_worker.py
+@@ -2,14 +2,19 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import mimetypes
++import re
+ from datetime import datetime, timedelta, timezone
++from pathlib import PurePath
++from typing import Any
+ 
+ from app.clients.mango import MangoClient
+-from app.common.config import get_settings
+-from app.common.db import mongo_db, postgres_pool
++from app.clients.minio import MinioStorage
++from app.common.config import Settings, get_settings
++from app.common.db import postgres_pool
+ from app.common.kafka import kafka_producer, publish_json
+ from app.common.logging import configure_logging
+-from app.common.models import CallDiscoveredEvent, TranscriptionRequestedEvent
++from app.common.models import CallDiscoveredEvent, CallRecord, DeadLetterEvent, TranscriptionRequestedEvent
+ from app.common.repository import Repository
+ 
+ logger = logging.getLogger(__name__)
+@@ -22,24 +27,110 @@ def _parse_cursor(value: str | None) -> datetime | None:
+     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+ 
+ 
++def _safe_component(value: str, fallback: str) -> str:
++    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip(".")
++    return cleaned or fallback
++
++
++async def _store_call(
++    call: CallRecord,
++    *,
++    repo: Repository,
++    mango: MangoClient,
++    storage: MinioStorage,
++    producer: Any,
++    settings: Settings,
++) -> None:
++    await repo.save_call(call)
++    if not call.recording_url and not call.recording_id:
++        await repo.mark_call_status(call.id, "no_recording", "Mango payload contains no recording reference")
++        return
++
++    existing = await repo.get_call(call.id)
++    object_name = existing.get("audio_object_name") if existing else None
++    filename = existing.get("audio_filename") if existing else None
++    if not object_name or not filename:
++        audio, downloaded_name = await mango.download_recording(
++            recording_url=call.recording_url, recording_id=call.recording_id
++        )
++        filename = _safe_component(PurePath(downloaded_name).name, "recording.mp3")
++        object_name = f"{_safe_component(call.id, 'call')}/{filename}"
++        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
++        await storage.upload(object_name, audio, content_type=content_type)
++        await repo.save_call(
++            call,
++            status="recorded",
++            audio_bucket=storage.bucket,
++            audio_object_name=object_name,
++            audio_filename=filename,
++        )
++
++    discovered = CallDiscoveredEvent(call=call)
++    requested = TranscriptionRequestedEvent(call_id=call.id, object_name=object_name, filename=filename)
++    await publish_json(producer, settings.topic_mango_raw, discovered.model_dump(mode="json"), key=call.id)
++    await publish_json(producer, settings.topic_to_transcribe, requested.model_dump(mode="json"), key=call.id)
++    logger.info("Call recording stored and transcription requested", extra={"call_id": call.id, "object": object_name})
++
++
++async def _store_call_with_retries(call: CallRecord, **dependencies: Any) -> None:
++    settings: Settings = dependencies["settings"]
++    repo: Repository = dependencies["repo"]
++    for attempt in range(1, settings.retry_max_attempts + 1):
++        try:
++            await _store_call(call, **dependencies)
++            return
++        except Exception as exc:
++            logger.exception("Mango call ingestion failed", extra={"call_id": call.id, "attempt": attempt})
++            if attempt < settings.retry_max_attempts:
++                await asyncio.sleep(settings.retry_backoff_seconds)
++                continue
++            event = DeadLetterEvent(
++                source_topic=settings.topic_mango_raw,
++                payload={"call_id": call.id, "call": call.model_dump(mode="json"), "attempt": attempt},
++                error=str(exc),
++                service="mango-worker",
++                attempts=attempt,
++            )
++            await publish_json(
++                dependencies["producer"], settings.topic_dead_letter, event.model_dump(mode="json"), key=call.id
++            )
++            try:
++                await repo.mark_call_status(call.id, "ingestion_failed", str(exc))
++            except Exception:
++                logger.exception("Cannot persist ingestion failure status", extra={"call_id": call.id})
++
++
+ async def run() -> None:
+     settings = get_settings()
+     configure_logging(settings.log_level)
+-    async with postgres_pool(settings) as pg, mongo_db(settings) as mongo, kafka_producer(settings) as producer:
+-        repo = Repository(pg, mongo)
++    async with postgres_pool(settings) as pg, kafka_producer(settings) as producer:
++        repo = Repository(pg)
+         mango = MangoClient(settings)
++        storage = MinioStorage(settings)
++        semaphore = asyncio.Semaphore(settings.mango_worker_concurrency)
++
++        async def process(call: CallRecord) -> None:
++            async with semaphore:
++                await _store_call_with_retries(
++                    call, repo=repo, mango=mango, storage=storage, producer=producer, settings=settings
++                )
++
+         try:
++            await storage.ensure_bucket()
+             while True:
+                 state = await repo.get_state(STATE_NAME) or {}
+                 last_cursor = _parse_cursor(state.get("cursor"))
+                 now = datetime.now(timezone.utc)
+-                if last_cursor is None:
+-                    date_from = now - timedelta(seconds=settings.mango_request_window_seconds)
+-                else:
+-                    date_from = last_cursor - timedelta(seconds=settings.mango_lookback_seconds)
++                date_from = (
++                    now - timedelta(seconds=settings.mango_request_window_seconds)
++                    if last_cursor is None
++                    else last_cursor - timedelta(seconds=settings.mango_lookback_seconds)
++                )
+                 date_to = min(date_from + timedelta(seconds=settings.mango_request_window_seconds), now)
+-
+-                logger.info("Polling Mango calls", extra={"date_from": date_from.isoformat(), "date_to": date_to.isoformat()})
++                logger.info(
++                    "Polling Mango calls",
++                    extra={"date_from": date_from.isoformat(), "date_to": date_to.isoformat()},
++                )
+                 try:
+                     calls = await mango.fetch_calls(date_from, date_to)
+                 except Exception:
+@@ -48,31 +139,19 @@ async def run() -> None:
+                     continue
+ 
+                 logger.info("Mango calls fetched", extra={"count": len(calls)})
+-                max_seen = date_to
+-                for call in calls:
+-                    await repo.save_call(call)
+-                    discovered = CallDiscoveredEvent(call=call)
+-                    await publish_json(producer, settings.topic_mango_raw, discovered.model_dump(mode="json"), key=call.id)
+-
+-                    if call.recording_url or call.recording_id:
+-                        requested = TranscriptionRequestedEvent(
+-                            call_id=call.id,
+-                            recording_id=call.recording_id,
+-                            recording_url=call.recording_url,
+-                        )
+-                        await publish_json(producer, settings.topic_to_transcribe, requested.model_dump(mode="json"), key=call.id)
+-                    else:
+-                        await repo.mark_call_status(call.id, "no_recording", "No recording_url/recording_id in Mango payload")
+-
+-                    for candidate in (call.finished_at, call.started_at):
+-                        if candidate and candidate > max_seen:
+-                            max_seen = candidate
+-
+-                await repo.set_state(STATE_NAME, {"cursor": max_seen.isoformat(), "last_poll_at": now.isoformat()})
++                await asyncio.gather(*(process(call) for call in calls))
++                max_seen = max(
++                    (candidate for call in calls for candidate in (call.finished_at, call.started_at) if candidate),
++                    default=date_to,
++                )
++                await repo.set_state(
++                    STATE_NAME,
++                    {"cursor": max(max_seen, date_to).isoformat(), "last_poll_at": now.isoformat()},
++                )
+                 await asyncio.sleep(settings.mango_poll_interval_seconds)
+         finally:
+             await mango.aclose()
+ 
+ 
+ if __name__ == "__main__":
+-    asyncio.run(run())
+\ No newline at end of file
++    asyncio.run(run())
+diff --git a/app/services/quality_worker.py b/app/services/quality_worker.py
+index 39c3b0a..981767f 100644
+--- a/app/services/quality_worker.py
++++ b/app/services/quality_worker.py
+@@ -5,26 +5,32 @@ import logging
+ from typing import Any
+ 
+ from app.clients.openai_qa import OpenAIQaClient
+-from app.common.config import get_settings
+-from app.common.db import mongo_db, postgres_pool
++from app.common.config import Settings, get_settings
++from app.common.db import postgres_pool
+ from app.common.kafka import commit_after, kafka_consumer, kafka_producer, publish_json
+ from app.common.logging import configure_logging
+-from app.common.models import DeadLetterEvent, QualityScoredEvent
++from app.common.models import NotificationRequestedEvent
+ from app.common.repository import Repository
++from app.common.retry import retry_or_dead_letter
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-async def _dead_letter(
+-    *,
+-    producer,
+-    settings,
+-    source_topic: str,
+-    payload: dict[str, Any],
+-    error: Exception,
++async def process_task(
++    payload: dict[str, Any], *, repo: Repository, ai: OpenAIQaClient, producer: Any, settings: Settings
+ ) -> None:
+-    event = DeadLetterEvent(source_topic=source_topic, payload=payload, error=str(error), service="quality-worker")
+-    await publish_json(producer, settings.topic_dead_letter, event.model_dump(mode="json"), key=payload.get("call_id"))
++    call_id = payload.get("call_id")
++    if not call_id:
++        raise ValueError("Kafka payload has no call_id")
++    if not await repo.quality_exists(call_id):
++        transcript = await repo.get_transcription(call_id)
++        if not transcript:
++            raise ValueError(f"No transcription for call_id={call_id}")
++        quality, raw = await ai.score_quality(transcript=transcript)
++        await repo.save_quality(call_id=call_id, quality=quality, model=settings.openai_quality_model, raw=raw)
++        logger.info("Call analyzed", extra={"call_id": call_id, "score": quality.score})
++    event = NotificationRequestedEvent(call_id=call_id)
++    await publish_json(producer, settings.topic_to_notify, event.model_dump(mode="json"), key=call_id)
+ 
+ 
+ async def run() -> None:
+@@ -32,50 +38,33 @@ async def run() -> None:
+     configure_logging(settings.log_level)
+     async with (
+         postgres_pool(settings) as pg,
+-        mongo_db(settings) as mongo,
+         kafka_producer(settings) as producer,
+-        kafka_consumer(settings, topic=settings.topic_transcribed, group_suffix="quality") as consumer,
++        kafka_consumer(settings, topic=settings.topic_to_analyze, group_suffix="quality") as consumer,
+     ):
+-        repo = Repository(pg, mongo)
+-        openai_client = OpenAIQaClient(settings)
+-        async for record in consumer:
+-            payload = record.value
+-            call_id = payload.get("call_id")
+-            try:
+-                if not call_id:
+-                    raise ValueError("Kafka payload has no call_id")
+-                if await repo.quality_exists(call_id):
+-                    logger.info("Quality score already exists, skipping", extra={"call_id": call_id})
+-                    await commit_after(record, consumer)
+-                    continue
+-
+-                transcript = await repo.get_transcription(call_id)
+-                if not transcript:
+-                    raise ValueError(f"No transcription for call_id={call_id}")
+-
+-                quality, raw = await openai_client.score_quality(transcript=transcript)
+-                await repo.save_quality(
+-                    call_id=call_id,
+-                    quality=quality,
+-                    model=settings.openai_quality_model,
+-                    raw=raw,
+-                )
+-                event = QualityScoredEvent(call_id=call_id, score=quality.score, model=settings.openai_quality_model)
+-                await publish_json(producer, settings.topic_quality, event.model_dump(mode="json"), key=call_id)
+-                await commit_after(record, consumer)
+-            except Exception as exc:
+-                logger.exception("Quality scoring failed", extra={"call_id": call_id})
+-                if call_id:
+-                    await repo.mark_call_status(call_id, "quality_failed", str(exc))
+-                await _dead_letter(
+-                    producer=producer,
+-                    settings=settings,
+-                    source_topic=record.topic,
+-                    payload=payload,
+-                    error=exc,
+-                )
++        repo = Repository(pg)
++        ai = OpenAIQaClient(settings)
++        try:
++            async for record in consumer:
++                payload = record.value if isinstance(record.value, dict) else {"invalid_payload": record.value}
++                call_id = payload.get("call_id")
++                try:
++                    await process_task(payload, repo=repo, ai=ai, producer=producer, settings=settings)
++                except Exception as exc:
++                    logger.exception("Analysis task failed", extra={"call_id": call_id})
++                    moved = await retry_or_dead_letter(
++                        producer=producer,
++                        settings=settings,
++                        source_topic=record.topic,
++                        payload=payload,
++                        error=exc,
++                        service="quality-worker",
++                    )
++                    if call_id:
++                        await repo.mark_call_status(call_id, "analysis_failed" if moved else "analysis_retry", str(exc))
+                 await commit_after(record, consumer)
++        finally:
++            await ai.aclose()
+ 
+ 
+ if __name__ == "__main__":
+-    asyncio.run(run())
+\ No newline at end of file
++    asyncio.run(run())
+diff --git a/app/services/telegram_worker.py b/app/services/telegram_worker.py
+new file mode 100644
+index 0000000..cc6e066
+--- /dev/null
++++ b/app/services/telegram_worker.py
+@@ -0,0 +1,102 @@
++from __future__ import annotations
++
++import asyncio
++import logging
++from typing import Any
++
++from app.clients.telegram import TelegramClient
++from app.common.config import Settings, get_settings
++from app.common.db import postgres_pool
++from app.common.formatting import format_analysis_message, format_dead_letter_message
++from app.common.kafka import commit_after, kafka_consumer, kafka_producer
++from app.common.logging import configure_logging
++from app.common.models import QualityResult
++from app.common.repository import Repository
++from app.common.retry import retry_or_dead_letter
++
++logger = logging.getLogger(__name__)
++
++
++async def process_notification(
++    payload: dict[str, Any], *, repo: Repository, telegram: TelegramClient, settings: Settings
++) -> None:
++    event_id = payload.get("event_id")
++    call_id = payload.get("call_id")
++    if not event_id or not call_id:
++        raise ValueError("Notification payload has no event_id/call_id")
++    if await repo.notification_exists(event_id, call_id, "main"):
++        return
++    call = await repo.get_call_with_results(call_id)
++    if not call or call.get("score") is None:
++        raise ValueError(f"No analysis for call_id={call_id}")
++    quality = QualityResult.model_validate(call)
++    await telegram.send(format_analysis_message(call, quality, settings.dashboard_base_url))
++    await repo.save_notification(event_id, call_id, "main")
++    logger.info("Telegram notification sent", extra={"call_id": call_id})
++
++
++async def process_dead_letter(payload: dict[str, Any], *, repo: Repository, telegram: TelegramClient) -> None:
++    event_id = payload.get("event_id")
++    if not event_id:
++        raise ValueError("Dead-letter payload has no event_id")
++    if await repo.notification_exists(event_id):
++        return
++    await telegram.send(format_dead_letter_message(payload), error_channel=True)
++    await repo.save_notification(event_id, (payload.get("payload") or {}).get("call_id"), "error")
++    logger.info("Dead-letter notification sent", extra={"event_id": event_id})
++
++
++async def process_dead_letter_with_retries(
++    payload: dict[str, Any], *, repo: Repository, telegram: TelegramClient, settings: Settings
++) -> None:
++    for attempt in range(1, settings.retry_max_attempts + 1):
++        try:
++            await process_dead_letter(payload, repo=repo, telegram=telegram)
++            return
++        except Exception:
++            if attempt == settings.retry_max_attempts:
++                raise
++            if settings.retry_backoff_seconds:
++                await asyncio.sleep(settings.retry_backoff_seconds)
++
++
++async def run() -> None:
++    settings = get_settings()
++    configure_logging(settings.log_level)
++    async with (
++        postgres_pool(settings) as pg,
++        kafka_producer(settings) as producer,
++        kafka_consumer(
++            settings, topic=(settings.topic_to_notify, settings.topic_dead_letter), group_suffix="telegram"
++        ) as consumer,
++    ):
++        repo = Repository(pg)
++        telegram = TelegramClient(settings)
++        try:
++            async for record in consumer:
++                payload = record.value if isinstance(record.value, dict) else {"invalid_payload": record.value}
++                try:
++                    if record.topic == settings.topic_dead_letter:
++                        await process_dead_letter_with_retries(
++                            payload, repo=repo, telegram=telegram, settings=settings
++                        )
++                    else:
++                        await process_notification(payload, repo=repo, telegram=telegram, settings=settings)
++                except Exception as exc:
++                    logger.exception("Telegram task failed", extra={"topic": record.topic})
++                    if record.topic != settings.topic_dead_letter:
++                        await retry_or_dead_letter(
++                            producer=producer,
++                            settings=settings,
++                            source_topic=record.topic,
++                            payload=payload,
++                            error=exc,
++                            service="telegram-worker",
++                        )
++                await commit_after(record, consumer)
++        finally:
++            await telegram.aclose()
++
++
++if __name__ == "__main__":
++    asyncio.run(run())
+diff --git a/app/services/transcriber_worker.py b/app/services/transcriber_worker.py
+index ef3015b..1f3a997 100644
+--- a/app/services/transcriber_worker.py
++++ b/app/services/transcriber_worker.py
+@@ -4,28 +4,45 @@ import asyncio
+ import logging
+ from typing import Any
+ 
+-from app.clients.mango import MangoClient
++from app.clients.minio import MinioStorage
+ from app.clients.openai_qa import OpenAIQaClient
+-from app.common.config import get_settings
+-from app.common.db import mongo_db, postgres_pool
++from app.common.config import Settings, get_settings
++from app.common.db import postgres_pool
+ from app.common.kafka import commit_after, kafka_consumer, kafka_producer, publish_json
+ from app.common.logging import configure_logging
+-from app.common.models import CallTranscribedEvent, DeadLetterEvent
++from app.common.models import AnalysisRequestedEvent
+ from app.common.repository import Repository
++from app.common.retry import retry_or_dead_letter
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-async def _dead_letter(
+-    *,
+-    producer,
+-    settings,
+-    source_topic: str,
++async def process_task(
+     payload: dict[str, Any],
+-    error: Exception,
++    *,
++    repo: Repository,
++    storage: MinioStorage,
++    ai: OpenAIQaClient,
++    producer: Any,
++    settings: Settings,
+ ) -> None:
+-    event = DeadLetterEvent(source_topic=source_topic, payload=payload, error=str(error), service="transcriber-worker")
+-    await publish_json(producer, settings.topic_dead_letter, event.model_dump(mode="json"), key=payload.get("call_id"))
++    call_id = payload.get("call_id")
++    if not call_id:
++        raise ValueError("Kafka payload has no call_id")
++    if not await repo.transcription_exists(call_id):
++        object_name = payload.get("object_name")
++        if not object_name:
++            raise ValueError("Kafka payload has no MinIO object_name")
++        audio = await storage.download(object_name)
++        transcript, raw = await ai.transcribe(audio=audio, filename=payload.get("filename") or "recording.mp3")
++        if not transcript.strip():
++            raise ValueError("Transcription returned empty text")
++        await repo.save_transcription(
++            call_id=call_id, transcript=transcript, model=settings.openai_transcribe_model, raw=raw
++        )
++        logger.info("Call transcribed", extra={"call_id": call_id, "chars": len(transcript)})
++    event = AnalysisRequestedEvent(call_id=call_id)
++    await publish_json(producer, settings.topic_to_analyze, event.model_dump(mode="json"), key=call_id)
+ 
+ 
+ async def run() -> None:
+@@ -33,60 +50,35 @@ async def run() -> None:
+     configure_logging(settings.log_level)
+     async with (
+         postgres_pool(settings) as pg,
+-        mongo_db(settings) as mongo,
+         kafka_producer(settings) as producer,
+         kafka_consumer(settings, topic=settings.topic_to_transcribe, group_suffix="transcriber") as consumer,
+     ):
+-        repo = Repository(pg, mongo)
+-        mango = MangoClient(settings)
+-        openai_client = OpenAIQaClient(settings)
++        repo = Repository(pg)
++        storage = MinioStorage(settings)
++        ai = OpenAIQaClient(settings)
+         try:
+             async for record in consumer:
+-                payload = record.value
++                payload = record.value if isinstance(record.value, dict) else {"invalid_payload": record.value}
+                 call_id = payload.get("call_id")
+                 try:
+-                    if not call_id:
+-                        raise ValueError("Kafka payload has no call_id")
+-                    if await repo.transcription_exists(call_id):
+-                        logger.info("Transcription already exists, skipping", extra={"call_id": call_id})
+-                        await commit_after(record, consumer)
+-                        continue
+-
+-                    recording_url = payload.get("recording_url")
+-                    recording_id = payload.get("recording_id")
+-                    audio, filename = await mango.download_recording(recording_url=recording_url, recording_id=recording_id)
+-                    transcript, raw = await openai_client.transcribe(audio=audio, filename=filename)
+-                    if not transcript.strip():
+-                        raise ValueError("OpenAI transcription returned empty text")
+-
+-                    await repo.save_transcription(
+-                        call_id=call_id,
+-                        transcript=transcript,
+-                        model=settings.openai_transcribe_model,
+-                        raw=raw,
+-                    )
+-                    event = CallTranscribedEvent(
+-                        call_id=call_id,
+-                        transcript_chars=len(transcript),
+-                        model=settings.openai_transcribe_model,
+-                    )
+-                    await publish_json(producer, settings.topic_transcribed, event.model_dump(mode="json"), key=call_id)
+-                    await commit_after(record, consumer)
++                    await process_task(payload, repo=repo, storage=storage, ai=ai, producer=producer, settings=settings)
+                 except Exception as exc:
+                     logger.exception("Transcription task failed", extra={"call_id": call_id})
+-                    if call_id:
+-                        await repo.mark_call_status(call_id, "transcription_failed", str(exc))
+-                    await _dead_letter(
++                    moved = await retry_or_dead_letter(
+                         producer=producer,
+                         settings=settings,
+                         source_topic=record.topic,
+                         payload=payload,
+                         error=exc,
++                        service="transcriber-worker",
+                     )
+-                    await commit_after(record, consumer)
++                    if call_id:
++                        status = "transcription_failed" if moved else "transcription_retry"
++                        await repo.mark_call_status(call_id, status, str(exc))
++                await commit_after(record, consumer)
+         finally:
+-            await mango.aclose()
++            await ai.aclose()
+ 
+ 
+ if __name__ == "__main__":
+-    asyncio.run(run())
+\ No newline at end of file
++    asyncio.run(run())
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 929a556..c69a434 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -5,8 +5,7 @@ services:
+       POSTGRES_DB: calls
+       POSTGRES_USER: app
+       POSTGRES_PASSWORD: app
+-    ports:
+-      - "5432:5432"
++    ports: ["5432:5432"]
+     volumes:
+       - postgres_data:/var/lib/postgresql/data
+       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+@@ -16,15 +15,20 @@ services:
+       timeout: 5s
+       retries: 20
+ 
+-  mongo:
+-    image: mongo:7
++  minio:
++    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
++    command: server /data --console-address ":9001"
++    environment:
++      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
++      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+     ports:
+-      - "27017:27017"
++      - "9000:9000"
++      - "9001:9001"
+     volumes:
+-      - mongo_data:/data/db
++      - minio_data:/data
+     healthcheck:
+-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+-      interval: 10s
++      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
++      interval: 5s
+       timeout: 5s
+       retries: 20
+ 
+@@ -56,63 +60,97 @@ services:
+       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
++      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+     healthcheck:
+       test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+       interval: 10s
+       timeout: 5s
+       retries: 20
+ 
++  kafka-init:
++    image: confluentinc/cp-kafka:7.7.1
++    depends_on:
++      kafka:
++        condition: service_healthy
++    env_file: .env
++    volumes:
++      - ./scripts/create_topics.sh:/create_topics.sh:ro
++    entrypoint: ["/bin/sh", "/create_topics.sh"]
++    restart: "no"
++
+   api:
+     build: .
+     command: python -m app.services.api
++    restart: unless-stopped
+     env_file: .env
+-    ports:
+-      - "8080:8080"
++    ports: ["8080:8080"]
+     depends_on:
+       postgres:
+         condition: service_healthy
+-      mongo:
+-        condition: service_healthy
+-      kafka:
++      minio:
+         condition: service_healthy
++    healthcheck:
++      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
++      interval: 10s
++      timeout: 5s
++      retries: 10
+ 
+   mango-worker:
+     build: .
+     command: python -m app.services.mango_worker
++    restart: unless-stopped
+     env_file: .env
+     depends_on:
+       postgres:
+         condition: service_healthy
+-      mongo:
+-        condition: service_healthy
+-      kafka:
++      minio:
+         condition: service_healthy
++      kafka-init:
++        condition: service_completed_successfully
++    healthcheck: &worker-health
++      test: ["CMD", "python", "-c", "from pathlib import Path; assert b'app.services' in Path('/proc/1/cmdline').read_bytes()"]
++      interval: 15s
++      timeout: 5s
++      retries: 3
+ 
+   transcriber-worker:
+     build: .
+     command: python -m app.services.transcriber_worker
++    restart: unless-stopped
+     env_file: .env
+     depends_on:
+       postgres:
+         condition: service_healthy
+-      mongo:
+-        condition: service_healthy
+-      kafka:
++      minio:
+         condition: service_healthy
++      kafka-init:
++        condition: service_completed_successfully
++    healthcheck: *worker-health
+ 
+   quality-worker:
+     build: .
+     command: python -m app.services.quality_worker
++    restart: unless-stopped
+     env_file: .env
+     depends_on:
+       postgres:
+         condition: service_healthy
+-      mongo:
+-        condition: service_healthy
+-      kafka:
++      kafka-init:
++        condition: service_completed_successfully
++    healthcheck: *worker-health
++
++  telegram-worker:
++    build: .
++    command: python -m app.services.telegram_worker
++    restart: unless-stopped
++    env_file: .env
++    depends_on:
++      postgres:
+         condition: service_healthy
++      kafka-init:
++        condition: service_completed_successfully
++    healthcheck: *worker-health
+ 
+ volumes:
+   postgres_data:
+-  mongo_data:
+\ No newline at end of file
++  minio_data:
+diff --git a/infra/postgres/init.sql b/infra/postgres/init.sql
+index 749a139..663c762 100644
+--- a/infra/postgres/init.sql
++++ b/infra/postgres/init.sql
+@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS calls (
+     finished_at TIMESTAMPTZ,
+     disconnect_reason TEXT,
+     raw JSONB NOT NULL DEFAULT '{}'::jsonb,
++    audio_bucket TEXT,
++    audio_object_name TEXT,
++    audio_filename TEXT,
+     status TEXT NOT NULL DEFAULT 'discovered',
+     error TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+@@ -34,16 +37,27 @@ CREATE TABLE IF NOT EXISTS transcriptions (
+ CREATE TABLE IF NOT EXISTS quality_scores (
+     call_id TEXT PRIMARY KEY REFERENCES calls(id) ON DELETE CASCADE,
+     score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
++    risk_level TEXT NOT NULL CHECK (risk_level IN ('critical', 'warning', 'normal')),
++    risk_reason TEXT NOT NULL,
+     summary TEXT NOT NULL,
+-    positives JSONB NOT NULL DEFAULT '[]'::jsonb,
+-    negatives JSONB NOT NULL DEFAULT '[]'::jsonb,
+-    recommendations JSONB NOT NULL DEFAULT '[]'::jsonb,
++    errors JSONB NOT NULL DEFAULT '[]'::jsonb,
++    recommendation TEXT NOT NULL,
+     criteria JSONB NOT NULL DEFAULT '{}'::jsonb,
+     raw JSONB NOT NULL DEFAULT '{}'::jsonb,
+     model TEXT NOT NULL,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+ );
+ 
++CREATE TABLE IF NOT EXISTS notifications (
++    event_id TEXT PRIMARY KEY,
++    call_id TEXT,
++    channel TEXT NOT NULL CHECK (channel IN ('main', 'error')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_main_call
++ON notifications(call_id) WHERE channel = 'main';
++
+ CREATE TABLE IF NOT EXISTS worker_state (
+     name TEXT PRIMARY KEY,
+     value JSONB NOT NULL DEFAULT '{}'::jsonb,
+@@ -59,6 +73,5 @@ END;
+ $$ LANGUAGE plpgsql;
+ 
+ DROP TRIGGER IF EXISTS calls_set_updated_at ON calls;
+-CREATE TRIGGER calls_set_updated_at
+-BEFORE UPDATE ON calls
+-FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+\ No newline at end of file
++CREATE TRIGGER calls_set_updated_at BEFORE UPDATE ON calls
++FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+diff --git a/pyproject.toml b/pyproject.toml
+index 0d5015a..039c633 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,13 @@
+ [tool.pytest.ini_options]
+ asyncio_mode = "auto"
+ pythonpath = ["."]
++addopts = "--cov=app --cov-report=term-missing --cov-fail-under=90"
++
++[tool.coverage.report]
++exclude_also = [
++    "if __name__ == .__main__.:",
++    "async def run\\(\\) -> None:",
++]
+ 
+ [tool.ruff]
+ line-length = 120
+@@ -8,4 +15,4 @@ target-version = "py312"
+ 
+ [tool.ruff.lint]
+ select = ["E", "F", "I", "UP", "B"]
+-ignore = ["B008"]
+\ No newline at end of file
++ignore = ["B008"]
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+index edf1983..7133fd0 100644
+--- a/requirements-dev.txt
++++ b/requirements-dev.txt
+@@ -1,4 +1,5 @@
+ -r requirements.txt
+ pytest==8.3.4
+ pytest-asyncio==0.25.0
+-ruff==0.8.6
+\ No newline at end of file
++pytest-cov==6.0.0
++ruff==0.8.6
+diff --git a/requirements.txt b/requirements.txt
+index ed87ac1..78128ab 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -3,9 +3,9 @@ asyncpg==0.30.0
+ fastapi==0.115.6
+ uvicorn[standard]==0.34.0
+ httpx==0.28.1
+-motor==3.6.0
++minio==7.2.15
+ openai==1.59.7
+ pydantic==2.10.4
+ pydantic-settings==2.7.1
+ python-dateutil==2.9.0.post0
+-orjson==3.10.12
+\ No newline at end of file
++orjson==3.10.12
+diff --git a/scripts/create_topics.sh b/scripts/create_topics.sh
+index a863d53..f117efe 100644
+--- a/scripts/create_topics.sh
++++ b/scripts/create_topics.sh
+@@ -5,10 +5,10 @@ BOOTSTRAP="${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}"
+ for topic in \
+   "${TOPIC_MANGO_RAW:-mango.calls.raw}" \
+   "${TOPIC_TO_TRANSCRIBE:-calls.to_transcribe}" \
+-  "${TOPIC_TRANSCRIBED:-calls.transcribed}" \
+-  "${TOPIC_QUALITY:-calls.quality}" \
++  "${TOPIC_TO_ANALYZE:-calls.to_analyze}" \
++  "${TOPIC_TO_NOTIFY:-calls.to_notify}" \
+   "${TOPIC_DEAD_LETTER:-calls.dead_letter}"
+ do
+   kafka-topics --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic "$topic" --partitions 3 --replication-factor 1
+   echo "topic ensured: $topic"
+-done
+\ No newline at end of file
++done
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..6082f07
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,21 @@
++from __future__ import annotations
++
++import pytest
++from pydantic import SecretStr
++
++from app.common.config import Settings
++
++
++@pytest.fixture
++def settings() -> Settings:
++    return Settings(
++        _env_file=None,
++        mango_api_key=SecretStr("mango-key"),
++        mango_api_salt=SecretStr("mango-salt"),
++        openrouter_api_key=SecretStr("router-key"),
++        telegram_bot_token=SecretStr("main-token"),
++        telegram_chat_id="main-chat",
++        telegram_error_bot_token=SecretStr("error-token"),
++        telegram_error_chat_id="error-chat",
++        retry_backoff_seconds=0,
++    )
+diff --git a/tests/test_api_logging.py b/tests/test_api_logging.py
+new file mode 100644
+index 0000000..614659d
+--- /dev/null
++++ b/tests/test_api_logging.py
+@@ -0,0 +1,70 @@
++from __future__ import annotations
++
++import logging
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++from fastapi import HTTPException
++
++from app.common.logging import configure_logging
++from app.services import api
++
++
++class Context:
++    def __init__(self, value) -> None:
++        self.value = value
++
++    async def __aenter__(self):
++        return self.value
++
++    async def __aexit__(self, *_args):
++        return False
++
++
++@pytest.mark.asyncio
++async def test_health_and_topics(monkeypatch) -> None:
++    conn = SimpleNamespace(fetchval=AsyncMock(return_value=1))
++    repo = SimpleNamespace(pg=SimpleNamespace(acquire=lambda: Context(conn)))
++    storage = SimpleNamespace(is_available=AsyncMock(return_value=True))
++    monkeypatch.setattr(api.app, "state", SimpleNamespace(repo=repo, storage=storage))
++    assert await api.health() == {"status": "ok", "postgres": True, "minio": True}
++    result = await api.topics()
++    assert result["to_transcribe"] == "calls.to_transcribe"
++    assert result["to_analyze"] == "calls.to_analyze"
++    assert result["to_notify"] == "calls.to_notify"
++
++
++@pytest.mark.asyncio
++async def test_degraded_health_and_call_endpoint(monkeypatch) -> None:
++    conn = SimpleNamespace(fetchval=AsyncMock(return_value=0))
++    repo = SimpleNamespace(
++        pg=SimpleNamespace(acquire=lambda: Context(conn)),
++        get_call_with_results=AsyncMock(side_effect=[{"id": "c1"}, None]),
++    )
++    storage = SimpleNamespace(is_available=AsyncMock(return_value=False))
++    monkeypatch.setattr(api.app, "state", SimpleNamespace(repo=repo, storage=storage))
++    assert (await api.health())["status"] == "degraded"
++    assert await api.get_call("c1") == {"id": "c1"}
++    with pytest.raises(HTTPException) as exc:
++        await api.get_call("missing")
++    assert exc.value.status_code == 404
++
++
++def test_logging_configuration_accepts_unknown_level() -> None:
++    configure_logging("NOT_A_LEVEL")
++    assert logging.getLogger().level in {logging.INFO, logging.WARNING}
++
++
++@pytest.mark.asyncio
++async def test_api_lifespan_opens_and_closes_resources(monkeypatch) -> None:
++    pool = SimpleNamespace(close=AsyncMock())
++    monkeypatch.setattr(api.asyncpg, "create_pool", AsyncMock(return_value=pool))
++    storage = object()
++    monkeypatch.setattr(api, "MinioStorage", lambda _settings: storage)
++    fake_app = SimpleNamespace(state=SimpleNamespace())
++    async with api.lifespan(fake_app):
++        assert fake_app.state.pg is pool
++        assert fake_app.state.storage is storage
++        assert fake_app.state.repo.pg is pool
++    pool.close.assert_awaited_once()
+diff --git a/tests/test_clients_infra.py b/tests/test_clients_infra.py
+new file mode 100644
+index 0000000..c1d7bb9
+--- /dev/null
++++ b/tests/test_clients_infra.py
+@@ -0,0 +1,193 @@
++from __future__ import annotations
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from app.clients.minio import MinioStorage
++from app.clients.openai_qa import QUALITY_JSON_SCHEMA, OpenAIQaClient
++from app.clients.telegram import TelegramClient
++from app.common import db, kafka
++from app.common.retry import retry_or_dead_letter
++
++
++class Dumpable:
++    def __init__(self, payload):
++        self.payload = payload
++
++    def model_dump(self, **_kwargs):
++        return self.payload
++
++
++@pytest.mark.asyncio
++async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -> None:
++    response = SimpleNamespace(read=MagicMock(return_value=b"audio"), close=MagicMock(), release_conn=MagicMock())
++    client = SimpleNamespace(
++        bucket_exists=MagicMock(side_effect=[False, True, RuntimeError("down")]),
++        make_bucket=MagicMock(),
++        put_object=MagicMock(),
++        get_object=MagicMock(return_value=response),
++    )
++    constructor = MagicMock(return_value=client)
++    monkeypatch.setattr("app.clients.minio.Minio", constructor)
++    storage = MinioStorage(settings)
++    await storage.upload("c/a.mp3", b"123", content_type="audio/mpeg")
++    client.make_bucket.assert_called_once_with("mango-calls")
++    args = client.put_object.call_args.args
++    assert args[:2] == ("mango-calls", "c/a.mp3") and args[4] == 3
++    assert await storage.download("c/a.mp3") == b"audio"
++    response.close.assert_called_once()
++    assert await storage.is_available()
++    assert not await storage.is_available()
++    constructor.assert_called_once()
++
++
++@pytest.mark.asyncio
++async def test_telegram_sends_to_both_channels_and_validates_response(settings) -> None:
++    telegram = TelegramClient(settings)
++    await telegram.http.aclose()
++    ok = SimpleNamespace(raise_for_status=MagicMock(), json=lambda: {"ok": True})
++    rejected = SimpleNamespace(raise_for_status=MagicMock(), json=lambda: {"ok": False, "description": "bad"})
++    telegram.http = SimpleNamespace(post=AsyncMock(side_effect=[ok, ok, rejected]), aclose=AsyncMock())
++    await telegram.send("main")
++    await telegram.send("error", error_channel=True)
++    assert "/botmain-token/sendMessage" in telegram.http.post.await_args_list[0].args[0]
++    assert telegram.http.post.await_args_list[1].kwargs["json"]["chat_id"] == "error-chat"
++    with pytest.raises(RuntimeError, match="rejected"):
++        await telegram.send("bad")
++    telegram.main_token = ""
++    with pytest.raises(RuntimeError, match="not configured"):
++        await telegram.send("missing")
++    await telegram.aclose()
++    telegram.http.aclose.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch) -> None:
++    quality = {
++        "score": 80,
++        "risk_level": "warning",
++        "risk_reason": "Нет следующего шага",
++        "summary": "Обсудили услугу",
++        "errors": ["Не назначена дата"],
++        "recommendation": "Перезвонить",
++        "criteria": {
++            "greeting": 90,
++            "needs_discovery": 80,
++            "urgency": 70,
++            "target_action": 80,
++            "objection_handling": 75,
++            "closing": 50,
++        },
++    }
++    completion = Dumpable({"choices": []})
++    completion.choices = [SimpleNamespace(message=SimpleNamespace(content=__import__("json").dumps(quality)))]
++    fake = SimpleNamespace(
++        audio=SimpleNamespace(
++            transcriptions=SimpleNamespace(create=AsyncMock(return_value=Dumpable({"text": "привет"})))
++        ),
++        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
++        close=AsyncMock(),
++    )
++    constructor = MagicMock(return_value=fake)
++    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", constructor)
++    settings.openrouter_http_referer = "https://app.example"
++    ai = OpenAIQaClient(settings)
++    text, raw = await ai.transcribe(audio=b"audio", filename="call.mp3")
++    result, response = await ai.score_quality(transcript="текст")
++    assert text == "привет" and raw["text"] == "привет"
++    assert result.score == 80 and response == {"choices": []}
++    kwargs = constructor.call_args.kwargs
++    assert kwargs["base_url"] == settings.openrouter_base_url
++    assert kwargs["default_headers"]["HTTP-Referer"] == "https://app.example"
++    assert QUALITY_JSON_SCHEMA["schema"]["additionalProperties"] is False
++    await ai.aclose()
++    fake.close.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_openrouter_transcription_fallback_and_empty_completion(settings, monkeypatch) -> None:
++    transcription = SimpleNamespace(text="fallback")
++    completion = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None))])
++    fake = SimpleNamespace(
++        audio=SimpleNamespace(transcriptions=SimpleNamespace(create=AsyncMock(return_value=transcription))),
++        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
++        close=AsyncMock(),
++    )
++    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
++    ai = OpenAIQaClient(settings)
++    assert (await ai.transcribe(audio=b"x", filename="x"))[0] == "fallback"
++    with pytest.raises(Exception):
++        await ai.score_quality(transcript="x")
++
++
++@pytest.mark.asyncio
++async def test_retry_republishes_then_moves_to_dead_letter(settings, monkeypatch) -> None:
++    publish = AsyncMock()
++    monkeypatch.setattr(kafka, "publish_json", publish)
++    producer = object()
++    moved = await retry_or_dead_letter(
++        producer=producer,
++        settings=settings,
++        source_topic="work",
++        payload={"call_id": "c", "attempt": 1},
++        error=ValueError("bad"),
++        service="worker",
++    )
++    assert not moved and publish.await_args.args[1] == "work"
++    assert publish.await_args.args[2]["attempt"] == 2
++    publish.reset_mock()
++    await retry_or_dead_letter(
++        producer=producer,
++        settings=settings,
++        source_topic="work",
++        payload={"call_id": "c", "attempt": "invalid"},
++        error=ValueError("bad"),
++        service="worker",
++    )
++    assert publish.await_args.args[2]["attempt"] == 2
++    publish.reset_mock()
++    moved = await retry_or_dead_letter(
++        producer=producer,
++        settings=settings,
++        source_topic="work",
++        payload={"call_id": "c", "attempt": 3},
++        error=ValueError("bad"),
++        service="worker",
++    )
++    assert moved and publish.await_args.args[1] == settings.topic_dead_letter
++    assert publish.await_args.args[2]["attempts"] == 3
++
++
++@pytest.mark.asyncio
++async def test_kafka_helpers_and_contexts(settings, monkeypatch) -> None:
++    producer = SimpleNamespace(start=AsyncMock(), stop=AsyncMock(), send_and_wait=AsyncMock())
++    producer_class = MagicMock(return_value=producer)
++    monkeypatch.setattr(kafka, "AIOKafkaProducer", producer_class)
++    async with kafka.kafka_producer(settings) as yielded:
++        await kafka.publish_json(yielded, "topic", {"x": 1}, key="key")
++    producer.start.assert_awaited_once()
++    producer.stop.assert_awaited_once()
++    producer.send_and_wait.assert_awaited_once_with("topic", {"x": 1}, key="key")
++
++    consumer = SimpleNamespace(start=AsyncMock(), stop=AsyncMock(), commit=AsyncMock())
++    consumer_class = MagicMock(return_value=consumer)
++    monkeypatch.setattr(kafka, "AIOKafkaConsumer", consumer_class)
++    async with kafka.kafka_consumer(settings, topic=("one", "two"), group_suffix="test") as yielded:
++        assert yielded is consumer
++    assert consumer_class.call_args.args == ("one", "two")
++    record = SimpleNamespace(topic="one", partition=0, offset=1)
++    await kafka.commit_after(record, consumer)
++    consumer.commit.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_postgres_context_closes_pool(settings, monkeypatch) -> None:
++    pool = SimpleNamespace(close=AsyncMock())
++    create_pool = AsyncMock(return_value=pool)
++    monkeypatch.setattr(db.asyncpg, "create_pool", create_pool)
++    async with db.postgres_pool(settings) as yielded:
++        assert yielded is pool
++    create_pool.assert_awaited_once_with(dsn=settings.postgres_dsn, min_size=1, max_size=10)
++    pool.close.assert_awaited_once()
+diff --git a/tests/test_core.py b/tests/test_core.py
+new file mode 100644
+index 0000000..dcfab61
+--- /dev/null
++++ b/tests/test_core.py
+@@ -0,0 +1,109 @@
++from __future__ import annotations
++
++from datetime import datetime
++
++import pytest
++from pydantic import ValidationError
++
++from app.common.config import Settings, get_settings
++from app.common.formatting import format_analysis_message, format_dead_letter_message
++from app.common.models import CallRecord, QualityCriteria, QualityResult, TranscriptionRequestedEvent
++from app.common.serialization import json_dumps_bytes, json_loads_bytes
++from app.prompts.quality import build_quality_user_prompt
++
++
++def quality(**overrides) -> QualityResult:
++    payload = {
++        "score": 60,
++        "risk_level": "critical",
++        "risk_reason": "Клиент ушел подумать без следующего шага.",
++        "summary": "Обсудили обслуживание автомобиля.",
++        "errors": ["Не отработано возражение", "Не назначен следующий шаг"],
++        "recommendation": "Перезвонить через два дня.",
++        "criteria": {
++            "greeting": 75,
++            "needs_discovery": 60,
++            "urgency": 20,
++            "target_action": 80,
++            "objection_handling": 40,
++            "closing": 40,
++        },
++    }
++    payload.update(overrides)
++    return QualityResult.model_validate(payload)
++
++
++def test_settings_parse_fields_and_cache() -> None:
++    value = Settings(_env_file=None, mango_stats_fields=" one, two ,,three ")
++    assert value.mango_fields_list == ["one", "two", "three"]
++    get_settings.cache_clear()
++    assert get_settings() is get_settings()
++    get_settings.cache_clear()
++
++
++def test_models_normalize_naive_datetime_and_validate_attempt() -> None:
++    call = CallRecord(id="1", started_at=datetime(2026, 5, 7, 18))
++    assert call.started_at and call.started_at.utcoffset().total_seconds() == 0
++    event = TranscriptionRequestedEvent(call_id="1", object_name="1/a.mp3", filename="a.mp3")
++    assert event.attempt == 1 and event.event_type == "transcription.requested"
++    with pytest.raises(ValidationError):
++        TranscriptionRequestedEvent(call_id="1", object_name="a", filename="a", attempt=0)
++
++
++def test_quality_schema_rejects_invalid_scores() -> None:
++    assert quality().criteria.greeting == 75
++    with pytest.raises(ValidationError):
++        QualityCriteria(
++            greeting=101,
++            needs_discovery=1,
++            urgency=1,
++            target_action=1,
++            objection_handling=1,
++            closing=1,
++        )
++
++
++def test_serialization_handles_datetime_and_rejects_unknown() -> None:
++    encoded = json_dumps_bytes({"at": datetime(2026, 1, 2, 3, 4)})
++    assert json_loads_bytes(encoded)["at"].startswith("2026-01-02T03:04")
++    with pytest.raises(TypeError):
++        json_dumps_bytes({"bad": object()})
++
++
++def test_analysis_message_matches_business_template() -> None:
++    call = {
++        "id": "137630",
++        "started_at": "2026-05-07T18:00:00+00:00",
++        "finished_at": "2026-05-07T18:03:44+00:00",
++        "direction": "incoming",
++        "from_number": "79990000000",
++        "recording_url": "https://example.test/play/1",
++        "raw": {"user_name": "user2", "deal_id": "42"},
++    }
++    message = format_analysis_message(call, quality(), "https://ainakontrole.ru/app/dashboard")
++    assert "🚨 РИСК СРЫВА СДЕЛКИ" in message
++    assert "👤 user2 · incoming · 79990000000" in message
++    assert "07.05.2026 18:00 · 3:44" in message
++    assert "👋75 · 🔍60 · 🔥20 · 🎯80 · 🛡40 · 🏁40" in message
++    assert "callId=137630" in message and "Сделка: 42" in message
++
++
++def test_noncritical_message_and_missing_call_fields() -> None:
++    message = format_analysis_message({"id": "x", "raw": {}}, quality(risk_level="normal", errors=[]), "https://x")
++    assert message.startswith("📞 АНАЛИЗ ЗВОНКА")
++    assert "Критичных ошибок не выявлено" in message
++    assert "📅 - · -" in message
++
++
++def test_dead_letter_format_and_prompt() -> None:
++    message = format_dead_letter_message(
++        {
++            "service": "quality-worker",
++            "source_topic": "calls.to_analyze",
++            "payload": {"call_id": "c1"},
++            "attempts": 3,
++            "error": "timeout",
++        }
++    )
++    assert "❗ ОШИБКА" in message and "Звонок: c1" in message and "Попыток: 3" in message
++    assert "текст звонка" in build_quality_user_prompt("текст звонка")
+diff --git a/tests/test_mango_client.py b/tests/test_mango_client.py
+index 02caca9..aebbe16 100644
+--- a/tests/test_mango_client.py
++++ b/tests/test_mango_client.py
+@@ -1,32 +1,166 @@
+ from __future__ import annotations
+ 
+ import hashlib
++from datetime import datetime, timezone
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
+ 
+-from pydantic import SecretStr
++import pytest
+ 
+-from app.clients.mango import MangoClient
+-from app.common.config import Settings
++from app.clients.mango import MangoApiError, MangoClient
+ 
+ 
+-def test_mango_signature_matches_sha256_api_key_json_salt() -> None:
+-    settings = Settings(mango_api_key=SecretStr("key"), mango_api_salt=SecretStr("salt"))
++class Response:
++    def __init__(self, *, data=None, text="", content=b"audio", headers=None) -> None:
++        self._data = data
++        self.text = text
++        self.content = content
++        self.headers = headers or {}
++        self.raise_for_status = lambda: None
++
++    def json(self):
++        return self._data
++
++
++def test_signature_and_json_are_stable(settings) -> None:
++    client = MangoClient(settings)
++    payload = {"date_from": 1, "message": "тест"}
++    json_payload, signature = client.sign(payload)
++    expected = hashlib.sha256(f"mango-key{json_payload}mango-salt".encode()).hexdigest()
++    assert signature == expected
++    assert " " not in json_payload and "тест" in json_payload
++    assert client.sign(json_payload)[0] == json_payload
++
++
++@pytest.mark.asyncio
++async def test_request_handles_json_text_empty_and_missing_credentials(settings) -> None:
++    client = MangoClient(settings)
++    await client.http.aclose()
++    client.http = SimpleNamespace(
++        post=AsyncMock(
++            side_effect=[
++                Response(data={"key": "1"}, headers={"content-type": "application/json"}),
++                Response(text='{"value": 2}'),
++                Response(text="plain"),
++                Response(text=""),
++            ]
++        )
++    )
++    assert await client.request("/stats", {}) == {"key": "1"}
++    assert await client.request("stats", {}) == {"value": 2}
++    assert await client.request("stats", {}) == "plain"
++    assert await client.request("stats", {}) is None
++    request = client.http.post.await_args_list[0]
++    assert request.args[0].endswith("/stats") and request.kwargs["data"]["vpbx_api_key"] == "mango-key"
++
++    client.api_key = ""
++    with pytest.raises(MangoApiError, match="required"):
++        await client.request("stats", {})
++
++
++@pytest.mark.asyncio
++async def test_fetch_calls_polls_until_ready(settings, monkeypatch) -> None:
++    settings.mango_stats_fields = "call_id,records,start,finish"
++    client = MangoClient(settings)
++    client.request = AsyncMock(
++        side_effect=[
++            {"result": {"key": "report-key"}},
++            {"code": 202},
++            {"data": [{"call_id": "c1", "records": "r1", "start": "1710000000"}]},
++        ]
++    )
++    sleep = AsyncMock()
++    monkeypatch.setattr("app.clients.mango.asyncio.sleep", sleep)
++    calls = await client.fetch_calls(
++        datetime(2026, 1, 1, tzinfo=timezone.utc),
++        datetime(2026, 1, 2, tzinfo=timezone.utc),
++    )
++    assert calls[0].id == "c1" and calls[0].recording_id == "r1"
++    sleep.assert_awaited_once()
++    await client.aclose()
++
++
++@pytest.mark.asyncio
++async def test_fetch_calls_rejects_missing_key_and_poll_timeout(settings, monkeypatch) -> None:
++    client = MangoClient(settings)
++    client.request = AsyncMock(return_value={})
++    with pytest.raises(MangoApiError, match="did not return key"):
++        await client.fetch_calls(datetime.now(timezone.utc), datetime.now(timezone.utc))
++
++    settings.mango_result_poll_attempts = 2
++    client.request = AsyncMock(side_effect=[{"key": "k"}, None, {"code": 202}])
++    monkeypatch.setattr("app.clients.mango.asyncio.sleep", AsyncMock())
++    with pytest.raises(MangoApiError, match="not ready"):
++        await client.fetch_calls(datetime.now(timezone.utc), datetime.now(timezone.utc))
++    await client.aclose()
++
++
++def test_result_parsing_and_readiness(settings) -> None:
++    client = MangoClient(settings)
++    fields = ["records", "start"]
++    csv = "records;start\n[rec-1];1710000000\n"
++    assert client._parse_stats_result(csv, fields)[0]["records"] == "rec-1"
++    assert client._parse_stats_result({"data": csv}, fields)[0]["start"] == "1710000000"
++    assert client._parse_stats_result({"result": {"csv": csv}}, fields)[0]["records"] == "rec-1"
++    assert client._parse_stats_result({"rows": [{"records": "r"}]}, fields) == [{"records": "r"}]
++    with pytest.raises(MangoApiError, match="Unsupported"):
++        client._parse_stats_result(42, fields)
++    assert not client._is_result_ready(None)
++    assert not client._is_result_ready({"code": 202})
++    assert client._is_result_ready({"code": 200, "data": []})
++    assert client._is_result_ready({})
++    assert not client._is_result_ready(" ")
++    assert client._is_result_ready("csv") and client._is_result_ready([])
++    assert client._extract_key(SimpleNamespace(key="x")) == "x"
++    assert client._extract_key({"result": "not-a-dict"}) is None
++
++
++def test_row_mapping_urls_dates_and_fallback(settings) -> None:
++    client = MangoClient(settings)
++    row = {
++        "entry_id": "e1",
++        "records": "[https://example.test/audio.mp3]",
++        "start": "2026-05-07 18:00:00",
++        "finish": "1809703880000",
++        "from_number": "1",
++        "to_number": "2",
++        "direction": "incoming",
++        "disconnect_reason": "normal",
++        "empty": "",
++    }
++    call = client._row_to_call(row)
++    assert call.id == "e1" and call.recording_url.startswith("https://")
++    assert call.recording_id is None and call.raw.get("empty") is None
++    assert call.started_at.tzinfo == timezone.utc and call.finished_at.tzinfo == timezone.utc
++    assert client._extract_recording_url({"record_url": "https://direct"}) == "https://direct"
++    assert client._extract_recording_url({}) is None
++    assert client._extract_recording_id({"record_id": "r"}) == "r"
++    assert client._extract_recording_id({}) is None
++    assert client._extract_recording_id({"records": "r1, r2"}) == "r1"
++    assert client._parse_mango_datetime(None) is None
++    assert client._parse_mango_datetime("bad date") is None
++    fallback = client._row_to_call({"from_number": "1"})
++    assert len(fallback.id) == 32 and fallback.id == client._stable_fallback_id({"from_number": "1"})
++
++
++@pytest.mark.asyncio
++async def test_download_recording_all_supported_responses(settings) -> None:
+     client = MangoClient(settings)
+-    payload = {"date_from": 1, "date_to": 2, "fields": "records,start"}
+-    json_payload, sign = client.sign(payload)
+-    expected = hashlib.sha256(f"key{json_payload}salt".encode("utf-8")).hexdigest()
+-    assert sign == expected
+-
+-
+-def test_parse_csv_uses_configured_fields() -> None:
+-    fields = ["records", "start", "finish", "from_number", "to_number"]
+-    payload = "rec-1;1710000000;1710000300;79990000000;78000000000\n"
+-    rows = MangoClient._parse_csv(payload, fields)
+-    assert rows == [
+-        {
+-            "records": "rec-1",
+-            "start": "1710000000",
+-            "finish": "1710000300",
+-            "from_number": "79990000000",
+-            "to_number": "78000000000",
+-        }
+-    ]
+\ No newline at end of file
++    await client.http.aclose()
++    client.http = SimpleNamespace(
++        get=AsyncMock(
++            side_effect=[
++                Response(content=b"one", headers={"content-disposition": 'attachment; filename="call.wav"'}),
++                Response(content=b"two"),
++                Response(content=b"three"),
++            ]
++        )
++    )
++    assert await client.download_recording(recording_url="https://a", recording_id=None) == (b"one", "call.wav")
++    client.request = AsyncMock(side_effect=["https://b", {"download_url": "https://c"}, {}])
++    assert await client.download_recording(recording_url=None, recording_id="r2") == (b"two", "r2.mp3")
++    assert await client.download_recording(recording_url=None, recording_id="r3") == (b"three", "r3.mp3")
++    with pytest.raises(MangoApiError, match="Cannot resolve"):
++        await client.download_recording(recording_url=None, recording_id="r4")
++    with pytest.raises(MangoApiError, match="No recording"):
++        await client.download_recording(recording_url=None, recording_id=None)
+diff --git a/tests/test_quality_schema.py b/tests/test_quality_schema.py
+deleted file mode 100644
+index a75b23e..0000000
+--- a/tests/test_quality_schema.py
++++ /dev/null
+@@ -1,23 +0,0 @@
+-from __future__ import annotations
+-
+-from app.common.models import QualityResult
+-
+-
+-def test_quality_result_accepts_valid_payload() -> None:
+-    payload = {
+-        "score": 88,
+-        "summary": "Хороший разговор с понятным следующим шагом.",
+-        "positives": ["Вежливо"],
+-        "negatives": ["Мало выявления потребностей"],
+-        "recommendations": ["Задавать больше уточняющих вопросов"],
+-        "criteria": {
+-            "greeting": 100,
+-            "needs_discovery": 70,
+-            "clarity": 90,
+-            "empathy": 90,
+-            "resolution": 85,
+-            "compliance": 95,
+-        },
+-    }
+-    result = QualityResult.model_validate(payload)
+-    assert result.score == 88
+\ No newline at end of file
+diff --git a/tests/test_repository.py b/tests/test_repository.py
+new file mode 100644
+index 0000000..b785610
+--- /dev/null
++++ b/tests/test_repository.py
+@@ -0,0 +1,154 @@
++from __future__ import annotations
++
++from datetime import datetime, timezone
++from decimal import Decimal
++from unittest.mock import AsyncMock
++
++import pytest
++
++from app.common.models import CallRecord, QualityResult
++from app.common.repository import Repository, _json, _to_primitive
++
++
++class Context:
++    def __init__(self, value) -> None:
++        self.value = value
++
++    async def __aenter__(self):
++        return self.value
++
++    async def __aexit__(self, *_args):
++        return False
++
++
++class Connection:
++    def __init__(self) -> None:
++        self.execute = AsyncMock()
++        self.fetchrow = AsyncMock()
++        self.fetchval = AsyncMock()
++
++    def transaction(self):
++        return Context(self)
++
++
++class Pool:
++    def __init__(self, conn) -> None:
++        self.conn = conn
++
++    def acquire(self):
++        return Context(self.conn)
++
++
++def quality() -> QualityResult:
++    return QualityResult.model_validate(
++        {
++            "score": 65,
++            "risk_level": "critical",
++            "risk_reason": "Нет следующего шага",
++            "summary": "Обсудили ремонт",
++            "errors": ["Не отработано возражение"],
++            "recommendation": "Перезвонить",
++            "criteria": {
++                "greeting": 80,
++                "needs_discovery": 75,
++                "urgency": 70,
++                "target_action": 75,
++                "objection_handling": 40,
++                "closing": 40,
++            },
++        }
++    )
++
++
++def test_primitive_conversion_and_json() -> None:
++    value = {
++        "amount": Decimal("1.5"),
++        "at": datetime(2026, 1, 1, tzinfo=timezone.utc),
++        "nested": [{"x": Decimal("2")}],
++    }
++    result = _to_primitive(value)
++    assert result == {
++        "amount": 1.5,
++        "at": "2026-01-01T00:00:00+00:00",
++        "nested": [{"x": 2.0}],
++    }
++    assert _json({"ok": True}) == '{"ok":true}'
++
++
++@pytest.mark.asyncio
++async def test_save_and_read_call() -> None:
++    conn = Connection()
++    repo = Repository(Pool(conn))
++    call = CallRecord(id="c1", recording_id="r1", raw={"source": "mango"})
++    await repo.save_call(
++        call,
++        status="recorded",
++        audio_bucket="bucket",
++        audio_object_name="c1/a.mp3",
++        audio_filename="a.mp3",
++    )
++    args = conn.execute.await_args.args
++    assert args[1] == "c1" and args[-3:] == ("bucket", "c1/a.mp3", "a.mp3")
++    await repo.mark_call_status("c1", "failed", "bad")
++    assert conn.execute.await_args.args[1:] == ("c1", "failed", "bad")
++
++    conn.fetchrow.side_effect = [
++        {"id": "c1", "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc)},
++        None,
++        {"id": "c1", "duration_seconds": Decimal("2.5")},
++        None,
++    ]
++    assert (await repo.get_call("c1"))["created_at"].startswith("2026")
++    assert await repo.get_call("missing") is None
++    assert (await repo.get_call_with_results("c1"))["duration_seconds"] == 2.5
++    assert await repo.get_call_with_results("missing") is None
++
++
++@pytest.mark.asyncio
++async def test_transcription_operations() -> None:
++    conn = Connection()
++    repo = Repository(Pool(conn))
++    await repo.save_transcription(call_id="c1", transcript="text", model="m", raw={"x": 1}, duration_seconds=3.5)
++    assert conn.execute.await_count == 2
++    insert_args = conn.execute.await_args_list[0].args
++    assert insert_args[1:4] == ("c1", "text", "m")
++
++    conn.fetchval.side_effect = [1, "transcript"]
++    assert await repo.transcription_exists("c1")
++    assert await repo.get_transcription("c1") == "transcript"
++
++
++@pytest.mark.asyncio
++async def test_quality_and_notification_operations() -> None:
++    conn = Connection()
++    repo = Repository(Pool(conn))
++    result = quality()
++    await repo.save_quality(call_id="c1", quality=result, model="mini")
++    assert conn.execute.await_count == 2
++    insert_args = conn.execute.await_args_list[0].args
++    assert insert_args[1:6] == (
++        "c1",
++        65,
++        "critical",
++        "Нет следующего шага",
++        "Обсудили ремонт",
++    )
++
++    conn.fetchval.side_effect = [True, False]
++    assert await repo.quality_exists("c1")
++    assert not await repo.notification_exists("e1")
++    await repo.save_notification("e1", "c1", "main")
++    assert conn.execute.await_count == 4
++    await repo.save_notification("e2", None, "error")
++    assert conn.execute.await_count == 5
++
++
++@pytest.mark.asyncio
++async def test_worker_state_operations() -> None:
++    conn = Connection()
++    repo = Repository(Pool(conn))
++    conn.fetchval.side_effect = [{"cursor": "now"}, None]
++    assert await repo.get_state("worker") == {"cursor": "now"}
++    assert await repo.get_state("missing") is None
++    await repo.set_state("worker", {"cursor": "later"})
++    assert conn.execute.await_args.args[1] == "worker"
+diff --git a/tests/test_workers.py b/tests/test_workers.py
+new file mode 100644
+index 0000000..73b6cc8
+--- /dev/null
++++ b/tests/test_workers.py
+@@ -0,0 +1,252 @@
++from __future__ import annotations
++
++from datetime import datetime, timezone
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from app.common.models import CallRecord, QualityResult
++from app.services import mango_worker, quality_worker, telegram_worker, transcriber_worker
++
++
++def call(**overrides) -> CallRecord:
++    payload = {
++        "id": "c1",
++        "recording_id": "r1",
++        "recording_url": "https://example.test/recording",
++        "started_at": datetime(2026, 5, 7, 18, tzinfo=timezone.utc),
++        "finished_at": datetime(2026, 5, 7, 18, 3, 44, tzinfo=timezone.utc),
++    }
++    payload.update(overrides)
++    return CallRecord(**payload)
++
++
++def quality() -> QualityResult:
++    return QualityResult.model_validate(
++        {
++            "score": 60,
++            "risk_level": "critical",
++            "risk_reason": "Нет следующего шага",
++            "summary": "Обсудили услугу",
++            "errors": ["Не отработано возражение"],
++            "recommendation": "Перезвонить",
++            "criteria": {
++                "greeting": 75,
++                "needs_discovery": 60,
++                "urgency": 20,
++                "target_action": 80,
++                "objection_handling": 40,
++                "closing": 40,
++            },
++        }
++    )
++
++
++def test_parse_cursor() -> None:
++    assert mango_worker._parse_cursor(None) is None
++    assert mango_worker._parse_cursor("2026-01-01T00:00:00Z").tzinfo is not None
++    assert mango_worker._safe_component("../bad/id", "fallback") == "_bad_id"
++    assert mango_worker._safe_component("...", "fallback") == "fallback"
++
++
++@pytest.mark.asyncio
++async def test_mango_store_downloads_uploads_and_publishes(settings, monkeypatch) -> None:
++    repo = SimpleNamespace(
++        save_call=AsyncMock(), get_call=AsyncMock(return_value=None), mark_call_status=AsyncMock()
++    )
++    mango = SimpleNamespace(download_recording=AsyncMock(return_value=(b"audio", "../call.mp3")))
++    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock())
++    publish = AsyncMock()
++    monkeypatch.setattr(mango_worker, "publish_json", publish)
++    producer = object()
++    await mango_worker._store_call(
++        call(), repo=repo, mango=mango, storage=storage, producer=producer, settings=settings
++    )
++    storage.upload.assert_awaited_once_with("c1/call.mp3", b"audio", content_type="audio/mpeg")
++    assert repo.save_call.await_count == 2
++    assert publish.await_count == 2
++    assert publish.await_args_list[1].args[1] == settings.topic_to_transcribe
++    assert publish.await_args_list[1].args[2]["object_name"] == "c1/call.mp3"
++
++
++@pytest.mark.asyncio
++async def test_mango_store_is_idempotent_and_handles_no_recording(settings, monkeypatch) -> None:
++    repo = SimpleNamespace(
++        save_call=AsyncMock(),
++        get_call=AsyncMock(return_value={"audio_object_name": "c1/old.wav", "audio_filename": "old.wav"}),
++        mark_call_status=AsyncMock(),
++    )
++    mango = SimpleNamespace(download_recording=AsyncMock())
++    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock())
++    publish = AsyncMock()
++    monkeypatch.setattr(mango_worker, "publish_json", publish)
++    await mango_worker._store_call(
++        call(), repo=repo, mango=mango, storage=storage, producer=object(), settings=settings
++    )
++    mango.download_recording.assert_not_awaited()
++    assert publish.await_args_list[1].args[2]["filename"] == "old.wav"
++
++    publish.reset_mock()
++    await mango_worker._store_call(
++        call(recording_id=None, recording_url=None),
++        repo=repo,
++        mango=mango,
++        storage=storage,
++        producer=object(),
++        settings=settings,
++    )
++    repo.mark_call_status.assert_awaited_with(
++        "c1", "no_recording", "Mango payload contains no recording reference"
++    )
++    publish.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_mango_ingestion_retries_three_times_then_dlq(settings, monkeypatch) -> None:
++    repo = SimpleNamespace(
++        save_call=AsyncMock(), get_call=AsyncMock(return_value=None), mark_call_status=AsyncMock()
++    )
++    mango = SimpleNamespace(download_recording=AsyncMock(side_effect=RuntimeError("download failed")))
++    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock())
++    publish = AsyncMock()
++    monkeypatch.setattr(mango_worker, "publish_json", publish)
++    await mango_worker._store_call_with_retries(
++        call(), repo=repo, mango=mango, storage=storage, producer=object(), settings=settings
++    )
++    assert mango.download_recording.await_count == 3
++    repo.mark_call_status.assert_awaited_once_with("c1", "ingestion_failed", "download failed")
++    assert publish.await_args.args[1] == settings.topic_dead_letter
++    assert publish.await_args.args[2]["attempts"] == 3
++
++
++@pytest.mark.asyncio
++async def test_transcriber_processes_audio_and_continues_idempotently(settings, monkeypatch) -> None:
++    repo = SimpleNamespace(
++        transcription_exists=AsyncMock(side_effect=[False, True]),
++        save_transcription=AsyncMock(),
++    )
++    storage = SimpleNamespace(download=AsyncMock(return_value=b"audio"))
++    ai = SimpleNamespace(transcribe=AsyncMock(return_value=("готовый текст", {"language": "ru"})))
++    publish = AsyncMock()
++    monkeypatch.setattr(transcriber_worker, "publish_json", publish)
++    payload = {"call_id": "c1", "object_name": "c1/a.mp3", "filename": "a.mp3"}
++    await transcriber_worker.process_task(
++        payload, repo=repo, storage=storage, ai=ai, producer=object(), settings=settings
++    )
++    repo.save_transcription.assert_awaited_once()
++    assert publish.await_args.args[1] == settings.topic_to_analyze
++    await transcriber_worker.process_task(
++        payload, repo=repo, storage=storage, ai=ai, producer=object(), settings=settings
++    )
++    assert storage.download.await_count == 1 and publish.await_count == 2
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("payload", "transcript", "message"),
++    [
++        ({}, "text", "call_id"),
++        ({"call_id": "c1"}, "text", "object_name"),
++        ({"call_id": "c1", "object_name": "x"}, " ", "empty"),
++    ],
++)
++async def test_transcriber_validates_payload(settings, monkeypatch, payload, transcript, message) -> None:
++    repo = SimpleNamespace(transcription_exists=AsyncMock(return_value=False), save_transcription=AsyncMock())
++    storage = SimpleNamespace(download=AsyncMock(return_value=b"audio"))
++    ai = SimpleNamespace(transcribe=AsyncMock(return_value=(transcript, {})))
++    monkeypatch.setattr(transcriber_worker, "publish_json", AsyncMock())
++    with pytest.raises(ValueError, match=message):
++        await transcriber_worker.process_task(
++            payload, repo=repo, storage=storage, ai=ai, producer=object(), settings=settings
++        )
++
++
++@pytest.mark.asyncio
++async def test_quality_worker_analyzes_and_continues_idempotently(settings, monkeypatch) -> None:
++    repo = SimpleNamespace(
++        quality_exists=AsyncMock(side_effect=[False, True]),
++        get_transcription=AsyncMock(return_value="transcript"),
++        save_quality=AsyncMock(),
++    )
++    ai = SimpleNamespace(score_quality=AsyncMock(return_value=(quality(), {"raw": True})))
++    publish = AsyncMock()
++    monkeypatch.setattr(quality_worker, "publish_json", publish)
++    await quality_worker.process_task({"call_id": "c1"}, repo=repo, ai=ai, producer=object(), settings=settings)
++    repo.save_quality.assert_awaited_once()
++    assert publish.await_args.args[1] == settings.topic_to_notify
++    await quality_worker.process_task({"call_id": "c1"}, repo=repo, ai=ai, producer=object(), settings=settings)
++    assert ai.score_quality.await_count == 1 and publish.await_count == 2
++
++
++@pytest.mark.asyncio
++async def test_quality_worker_validates_input(settings, monkeypatch) -> None:
++    repo = SimpleNamespace(
++        quality_exists=AsyncMock(return_value=False), get_transcription=AsyncMock(return_value=None)
++    )
++    monkeypatch.setattr(quality_worker, "publish_json", AsyncMock())
++    with pytest.raises(ValueError, match="call_id"):
++        await quality_worker.process_task({}, repo=repo, ai=object(), producer=object(), settings=settings)
++    with pytest.raises(ValueError, match="No transcription"):
++        await quality_worker.process_task(
++            {"call_id": "c1"}, repo=repo, ai=object(), producer=object(), settings=settings
++        )
++
++
++@pytest.mark.asyncio
++async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None:
++    result = quality().model_dump(mode="json")
++    call_data = {
++        "id": "c1",
++        "started_at": "2026-05-07T18:00:00+00:00",
++        "finished_at": "2026-05-07T18:03:44+00:00",
++        "recording_url": "https://example.test",
++        "raw": {},
++        **result,
++    }
++    repo = SimpleNamespace(
++        notification_exists=AsyncMock(side_effect=[False, True, False]),
++        get_call_with_results=AsyncMock(return_value=call_data),
++        save_notification=AsyncMock(),
++    )
++    telegram = SimpleNamespace(send=AsyncMock())
++    payload = {"event_id": "e1", "call_id": "c1"}
++    await telegram_worker.process_notification(payload, repo=repo, telegram=telegram, settings=settings)
++    assert "РИСК СРЫВА" in telegram.send.await_args.args[0]
++    repo.save_notification.assert_awaited_with("e1", "c1", "main")
++    await telegram_worker.process_notification(payload, repo=repo, telegram=telegram, settings=settings)
++    assert telegram.send.await_count == 1
++
++    dlq = {"event_id": "e2", "payload": {"call_id": "c1"}, "attempts": 3, "error": "bad"}
++    await telegram_worker.process_dead_letter(dlq, repo=repo, telegram=telegram)
++    assert telegram.send.await_args.kwargs["error_channel"] is True
++    repo.save_notification.assert_awaited_with("e2", "c1", "error")
++
++
++@pytest.mark.asyncio
++async def test_telegram_worker_validates_payload_and_analysis(settings) -> None:
++    repo = SimpleNamespace(
++        notification_exists=AsyncMock(return_value=False),
++        get_call_with_results=AsyncMock(return_value=None),
++    )
++    telegram = SimpleNamespace(send=AsyncMock())
++    with pytest.raises(ValueError, match="event_id/call_id"):
++        await telegram_worker.process_notification({}, repo=repo, telegram=telegram, settings=settings)
++    with pytest.raises(ValueError, match="No analysis"):
++        await telegram_worker.process_notification(
++            {"event_id": "e", "call_id": "c"}, repo=repo, telegram=telegram, settings=settings
++        )
++    with pytest.raises(ValueError, match="event_id"):
++        await telegram_worker.process_dead_letter({}, repo=repo, telegram=telegram)
++
++
++@pytest.mark.asyncio
++async def test_error_bot_delivery_is_retried_three_times(settings) -> None:
++    repo = SimpleNamespace(notification_exists=AsyncMock(return_value=False))
++    telegram = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("telegram down")))
++    payload = {"event_id": "e", "payload": {"call_id": "c"}}
++    with pytest.raises(RuntimeError, match="telegram down"):
++        await telegram_worker.process_dead_letter_with_retries(
++            payload, repo=repo, telegram=telegram, settings=settings
++        )
++    assert telegram.send.await_count == 3

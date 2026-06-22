@@ -1,1 +1,1 @@
-print("Use one of: python -m app.services.api | mango_worker | transcriber_worker | quality_worker")
+print("Use one of: python -m app.services.api | mango_worker | transcriber_worker | quality_worker | telegram_worker")

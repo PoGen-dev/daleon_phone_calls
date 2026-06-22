@@ -14,14 +14,23 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     postgres_dsn: str = "postgresql://app:app@postgres:5432/calls"
-    mongo_dsn: str = "mongodb://mongo:27017"
-    mongo_database: str = "mango_calls"
     kafka_bootstrap_servers: str = "kafka:9092"
     kafka_group_prefix: str = "mango-calls-local"
+    retry_max_attempts: int = Field(default=3, ge=1)
+    retry_backoff_seconds: float = Field(default=2.0, ge=0)
 
-    openai_api_key: SecretStr = Field(default=SecretStr(""))
-    openai_transcribe_model: str = "gpt-4o-transcribe"
-    openai_quality_model: str = "gpt-4o-mini"
+    minio_endpoint: str = "minio:9000"
+    minio_access_key: SecretStr = Field(default=SecretStr("minioadmin"))
+    minio_secret_key: SecretStr = Field(default=SecretStr("minioadmin"))
+    minio_bucket: str = "mango-calls"
+    minio_secure: bool = False
+
+    openrouter_api_key: SecretStr = Field(default=SecretStr(""))
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_http_referer: str | None = None
+    openrouter_app_name: str = "Mango Transcribe Analysis"
+    openai_transcribe_model: str = "openai/gpt-4o-transcribe"
+    openai_quality_model: str = "openai/gpt-4o-mini"
     openai_quality_temperature: float = 0.0
 
     mango_api_base_url: str = "https://app.mango-office.ru/vpbx"
@@ -35,15 +44,23 @@ class Settings(BaseSettings):
     mango_request_window_seconds: int = 300
     mango_result_poll_attempts: int = 12
     mango_result_poll_interval_seconds: int = 5
+    mango_worker_concurrency: int = Field(default=4, ge=1)
     mango_stats_fields: Annotated[str, Field(description="Comma-separated Mango stats fields")] = (
         "records,start,finish,from_extension,from_number,to_extension,to_number,disconnect_reason"
     )
     mango_default_timezone: str = "Europe/Moscow"
 
+    telegram_bot_token: SecretStr = Field(default=SecretStr(""))
+    telegram_chat_id: str = ""
+    telegram_error_bot_token: SecretStr = Field(default=SecretStr(""))
+    telegram_error_chat_id: str = ""
+    telegram_api_base_url: str = "https://api.telegram.org"
+    dashboard_base_url: str = "https://ainakontrole.ru/app/dashboard"
+
     topic_mango_raw: str = "mango.calls.raw"
     topic_to_transcribe: str = "calls.to_transcribe"
-    topic_transcribed: str = "calls.transcribed"
-    topic_quality: str = "calls.quality"
+    topic_to_analyze: str = "calls.to_analyze"
+    topic_to_notify: str = "calls.to_notify"
     topic_dead_letter: str = "calls.dead_letter"
 
     api_host: str = "0.0.0.0"

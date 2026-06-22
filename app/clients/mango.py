@@ -100,7 +100,8 @@ class MangoClient:
 
     def _extract_key(self, value: Any) -> str | None:
         if isinstance(value, dict):
-            return value.get("key") or value.get("result", {}).get("key")
+            nested = value.get("result")
+            return value.get("key") or (nested.get("key") if isinstance(nested, dict) else None)
         return getattr(value, "key", None)
 
     def _is_result_ready(self, value: Any) -> bool:

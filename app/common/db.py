@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import asyncpg
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 from app.common.config import Settings
 
@@ -16,12 +15,3 @@ async def postgres_pool(settings: Settings) -> AsyncIterator[asyncpg.Pool]:
         yield pool
     finally:
         await pool.close()
-
-
-@asynccontextmanager
-async def mongo_db(settings: Settings) -> AsyncIterator[AsyncIOMotorDatabase]:
-    client: AsyncIOMotorClient = AsyncIOMotorClient(settings.mongo_dsn)
-    try:
-        yield client[settings.mongo_database]
-    finally:
-        client.close()

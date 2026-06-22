@@ -1,6 +1,13 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
+addopts = "--cov=app --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.report]
+exclude_also = [
+    "if __name__ == .__main__.:",
+    "async def run\\(\\) -> None:",
+]
 
 [tool.ruff]
 line-length = 120

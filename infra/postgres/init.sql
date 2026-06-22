@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS calls (
     finished_at TIMESTAMPTZ,
     disconnect_reason TEXT,
     raw JSONB NOT NULL DEFAULT '{}'::jsonb,
+    audio_bucket TEXT,
+    audio_object_name TEXT,
+    audio_filename TEXT,
     status TEXT NOT NULL DEFAULT 'discovered',
     error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -34,15 +37,26 @@ CREATE TABLE IF NOT EXISTS transcriptions (
 CREATE TABLE IF NOT EXISTS quality_scores (
     call_id TEXT PRIMARY KEY REFERENCES calls(id) ON DELETE CASCADE,
     score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
+    risk_level TEXT NOT NULL CHECK (risk_level IN ('critical', 'warning', 'normal')),
+    risk_reason TEXT NOT NULL,
     summary TEXT NOT NULL,
-    positives JSONB NOT NULL DEFAULT '[]'::jsonb,
-    negatives JSONB NOT NULL DEFAULT '[]'::jsonb,
-    recommendations JSONB NOT NULL DEFAULT '[]'::jsonb,
+    errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+    recommendation TEXT NOT NULL,
     criteria JSONB NOT NULL DEFAULT '{}'::jsonb,
     raw JSONB NOT NULL DEFAULT '{}'::jsonb,
     model TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS notifications (
+    event_id TEXT PRIMARY KEY,
+    call_id TEXT,
+    channel TEXT NOT NULL CHECK (channel IN ('main', 'error')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_main_call
+ON notifications(call_id) WHERE channel = 'main';
 
 CREATE TABLE IF NOT EXISTS worker_state (
     name TEXT PRIMARY KEY,
@@ -59,6 +73,5 @@ END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS calls_set_updated_at ON calls;
-CREATE TRIGGER calls_set_updated_at
-BEFORE UPDATE ON calls
+CREATE TRIGGER calls_set_updated_at BEFORE UPDATE ON calls
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();

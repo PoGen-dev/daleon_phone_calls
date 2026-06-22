@@ -33,11 +33,12 @@ async def kafka_producer(settings: Settings) -> AsyncIterator[AIOKafkaProducer]:
 async def kafka_consumer(
     settings: Settings,
     *,
-    topic: str,
+    topic: str | tuple[str, ...],
     group_suffix: str,
 ) -> AsyncIterator[AIOKafkaConsumer]:
+    topics = (topic,) if isinstance(topic, str) else topic
     consumer = AIOKafkaConsumer(
-        topic,
+        *topics,
         bootstrap_servers=settings.kafka_bootstrap_servers,
         group_id=f"{settings.kafka_group_prefix}-{group_suffix}",
         enable_auto_commit=False,

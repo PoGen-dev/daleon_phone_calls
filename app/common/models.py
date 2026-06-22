@@ -35,30 +35,30 @@ class BaseEvent(BaseModel):
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class TaskEvent(BaseEvent):
+    attempt: int = Field(default=1, ge=1)
+
+
 class CallDiscoveredEvent(BaseEvent):
     event_type: Literal["call.discovered"] = "call.discovered"
     call: CallRecord
 
 
-class TranscriptionRequestedEvent(BaseEvent):
+class TranscriptionRequestedEvent(TaskEvent):
     event_type: Literal["transcription.requested"] = "transcription.requested"
     call_id: str
-    recording_id: str | None = None
-    recording_url: str | None = None
+    object_name: str
+    filename: str
 
 
-class CallTranscribedEvent(BaseEvent):
-    event_type: Literal["call.transcribed"] = "call.transcribed"
+class AnalysisRequestedEvent(TaskEvent):
+    event_type: Literal["analysis.requested"] = "analysis.requested"
     call_id: str
-    transcript_chars: int
-    model: str
 
 
-class QualityScoredEvent(BaseEvent):
-    event_type: Literal["call.quality_scored"] = "call.quality_scored"
+class NotificationRequestedEvent(TaskEvent):
+    event_type: Literal["notification.requested"] = "notification.requested"
     call_id: str
-    score: int
-    model: str
 
 
 class DeadLetterEvent(BaseEvent):
@@ -67,12 +67,23 @@ class DeadLetterEvent(BaseEvent):
     payload: dict[str, Any]
     error: str
     service: str
+    attempts: int
+
+
+class QualityCriteria(BaseModel):
+    greeting: int = Field(ge=0, le=100)
+    needs_discovery: int = Field(ge=0, le=100)
+    urgency: int = Field(ge=0, le=100)
+    target_action: int = Field(ge=0, le=100)
+    objection_handling: int = Field(ge=0, le=100)
+    closing: int = Field(ge=0, le=100)
 
 
 class QualityResult(BaseModel):
     score: int = Field(ge=0, le=100)
+    risk_level: Literal["critical", "warning", "normal"]
+    risk_reason: str
     summary: str
-    positives: list[str] = Field(default_factory=list)
-    negatives: list[str] = Field(default_factory=list)
-    recommendations: list[str] = Field(default_factory=list)
-    criteria: dict[str, int] = Field(default_factory=dict)
+    errors: list[str] = Field(default_factory=list)
+    recommendation: str
+    criteria: QualityCriteria

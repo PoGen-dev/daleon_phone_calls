@@ -3,7 +3,7 @@ asyncpg==0.30.0
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
-motor==3.6.0
+minio==7.2.15
 openai==1.59.7
 pydantic==2.10.4
 pydantic-settings==2.7.1
