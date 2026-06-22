@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 
 from app.clients.minio import MinioStorage
 from app.common.config import Settings, get_settings
+from app.common.db import _configure_connection
 from app.common.logging import configure_logging
 from app.common.repository import Repository
 
@@ -18,7 +19,12 @@ configure_logging(settings.log_level)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    pg = await asyncpg.create_pool(dsn=settings.postgres_dsn, min_size=1, max_size=10)
+    pg = await asyncpg.create_pool(
+        dsn=settings.postgres_dsn,
+        min_size=1,
+        max_size=10,
+        init=_configure_connection,
+    )
     app.state.pg = pg
     app.state.repo = Repository(pg)
     app.state.storage = MinioStorage(settings)

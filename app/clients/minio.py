@@ -43,6 +43,9 @@ class MinioStorage:
             await asyncio.to_thread(response.close)
             await asyncio.to_thread(response.release_conn)
 
+    async def remove(self, object_name: str) -> None:
+        await asyncio.to_thread(self.client.remove_object, self.bucket, object_name)
+
     async def is_available(self) -> bool:
         try:
             await asyncio.to_thread(self.client.bucket_exists, self.bucket)

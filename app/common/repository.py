@@ -6,8 +6,8 @@ from typing import Any
 
 import asyncpg
 
-from app.common.models import CallRecord, QualityResult
-from app.common.serialization import json_dumps_bytes
+from app.common.models import CallRecord, OutboxMessage, QualityResult
+from app.common.serialization import json_dumps_bytes, json_loads_bytes
 
 
 def _json(payload: Any) -> str:
@@ -40,50 +40,161 @@ class Repository:
         audio_filename: str | None = None,
     ) -> None:
         async with self.pg.acquire() as conn:
+            await self._save_call(
+                conn,
+                call,
+                status=status,
+                audio_bucket=audio_bucket,
+                audio_object_name=audio_object_name,
+                audio_filename=audio_filename,
+            )
+
+    @staticmethod
+    async def _save_call(
+        conn: asyncpg.Connection,
+        call: CallRecord,
+        *,
+        status: str,
+        audio_bucket: str | None,
+        audio_object_name: str | None,
+        audio_filename: str | None,
+    ) -> None:
+        await conn.execute(
+            """
+            INSERT INTO calls (
+                id, entry_id, call_id, recording_id, recording_url, direction,
+                from_number, to_number, started_at, finished_at, disconnect_reason, raw, status,
+                audio_bucket, audio_object_name, audio_filename
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16)
+            ON CONFLICT (id) DO UPDATE SET
+                entry_id = EXCLUDED.entry_id,
+                call_id = EXCLUDED.call_id,
+                recording_id = COALESCE(EXCLUDED.recording_id, calls.recording_id),
+                recording_url = COALESCE(EXCLUDED.recording_url, calls.recording_url),
+                direction = COALESCE(EXCLUDED.direction, calls.direction),
+                from_number = COALESCE(EXCLUDED.from_number, calls.from_number),
+                to_number = COALESCE(EXCLUDED.to_number, calls.to_number),
+                started_at = COALESCE(EXCLUDED.started_at, calls.started_at),
+                finished_at = COALESCE(EXCLUDED.finished_at, calls.finished_at),
+                disconnect_reason = COALESCE(EXCLUDED.disconnect_reason, calls.disconnect_reason),
+                raw = calls.raw || EXCLUDED.raw,
+                audio_bucket = COALESCE(EXCLUDED.audio_bucket, calls.audio_bucket),
+                audio_object_name = COALESCE(EXCLUDED.audio_object_name, calls.audio_object_name),
+                audio_filename = COALESCE(EXCLUDED.audio_filename, calls.audio_filename),
+                status = CASE
+                    WHEN calls.status IN ('recorded', 'transcribed', 'analyzed', 'notified') THEN calls.status
+                    ELSE EXCLUDED.status
+                END,
+                error = NULL
+            """,
+            call.id,
+            call.entry_id,
+            call.call_id,
+            call.recording_id,
+            call.recording_url,
+            call.direction,
+            call.from_number,
+            call.to_number,
+            call.started_at,
+            call.finished_at,
+            call.disconnect_reason,
+            _json(call.raw),
+            status,
+            audio_bucket,
+            audio_object_name,
+            audio_filename,
+        )
+
+    @staticmethod
+    async def _enqueue_outbox(conn: asyncpg.Connection, messages: list[OutboxMessage]) -> None:
+        for message in messages:
             await conn.execute(
                 """
-                INSERT INTO calls (
-                    id, entry_id, call_id, recording_id, recording_url, direction,
-                    from_number, to_number, started_at, finished_at, disconnect_reason, raw, status,
-                    audio_bucket, audio_object_name, audio_filename
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16)
-                ON CONFLICT (id) DO UPDATE SET
-                    entry_id = EXCLUDED.entry_id,
-                    call_id = EXCLUDED.call_id,
-                    recording_id = COALESCE(EXCLUDED.recording_id, calls.recording_id),
-                    recording_url = COALESCE(EXCLUDED.recording_url, calls.recording_url),
-                    direction = COALESCE(EXCLUDED.direction, calls.direction),
-                    from_number = COALESCE(EXCLUDED.from_number, calls.from_number),
-                    to_number = COALESCE(EXCLUDED.to_number, calls.to_number),
-                    started_at = COALESCE(EXCLUDED.started_at, calls.started_at),
-                    finished_at = COALESCE(EXCLUDED.finished_at, calls.finished_at),
-                    disconnect_reason = COALESCE(EXCLUDED.disconnect_reason, calls.disconnect_reason),
-                    raw = calls.raw || EXCLUDED.raw,
-                    audio_bucket = COALESCE(EXCLUDED.audio_bucket, calls.audio_bucket),
-                    audio_object_name = COALESCE(EXCLUDED.audio_object_name, calls.audio_object_name),
-                    audio_filename = COALESCE(EXCLUDED.audio_filename, calls.audio_filename),
-                    status = CASE
-                        WHEN calls.status IN ('recorded', 'transcribed', 'analyzed', 'notified') THEN calls.status
-                        ELSE EXCLUDED.status
-                    END,
-                    error = NULL
+                INSERT INTO outbox_events (topic, message_key, payload, dedupe_key)
+                VALUES ($1,$2,$3::jsonb,$4)
+                ON CONFLICT (dedupe_key) DO NOTHING
                 """,
-                call.id,
-                call.entry_id,
-                call.call_id,
-                call.recording_id,
-                call.recording_url,
-                call.direction,
-                call.from_number,
-                call.to_number,
-                call.started_at,
-                call.finished_at,
-                call.disconnect_reason,
-                _json(call.raw),
-                status,
-                audio_bucket,
-                audio_object_name,
-                audio_filename,
+                message.topic,
+                message.key,
+                _json(message.payload),
+                message.dedupe_key,
+            )
+
+    async def save_call_and_enqueue(
+        self,
+        call: CallRecord,
+        *,
+        status: str,
+        audio_bucket: str,
+        audio_object_name: str,
+        audio_filename: str,
+        messages: list[OutboxMessage],
+    ) -> None:
+        async with self.pg.acquire() as conn:
+            async with conn.transaction():
+                await self._save_call(
+                    conn,
+                    call,
+                    status=status,
+                    audio_bucket=audio_bucket,
+                    audio_object_name=audio_object_name,
+                    audio_filename=audio_filename,
+                )
+                await self._enqueue_outbox(conn, messages)
+
+    async def mark_call_failed_and_enqueue(
+        self, call_id: str, error: str, message: OutboxMessage
+    ) -> None:
+        async with self.pg.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    UPDATE calls SET
+                        status=CASE
+                            WHEN status IN ('recorded','transcribed','analyzed','notified') THEN status
+                            ELSE 'ingestion_failed'
+                        END,
+                        error=$2
+                    WHERE id=$1
+                    """,
+                    call_id,
+                    error,
+                )
+                await self._enqueue_outbox(conn, [message])
+
+    async def get_pending_outbox(self, limit: int = 100) -> list[dict[str, Any]]:
+        async with self.pg.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, topic, message_key, payload, attempts
+                FROM outbox_events
+                WHERE published_at IS NULL
+                ORDER BY id
+                LIMIT $1
+                """,
+                limit,
+            )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            if isinstance(item["payload"], (str, bytes, bytearray)):
+                item["payload"] = json_loads_bytes(item["payload"])
+            result.append(item)
+        return result
+
+    async def mark_outbox_published(self, event_id: int) -> None:
+        async with self.pg.acquire() as conn:
+            await conn.execute(
+                "UPDATE outbox_events SET published_at=now(), last_error=NULL WHERE id=$1",
+                event_id,
+            )
+
+    async def mark_outbox_failed(self, event_id: int, error: str) -> None:
+        async with self.pg.acquire() as conn:
+            await conn.execute(
+                "UPDATE outbox_events SET attempts=attempts+1, last_error=$2 WHERE id=$1",
+                event_id,
+                error,
             )
 
     async def mark_call_status(self, call_id: str, status: str, error: str | None = None) -> None:

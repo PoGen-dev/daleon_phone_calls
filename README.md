@@ -2,13 +2,14 @@
 
 Асинхронный pipeline обработки звонков MANGO OFFICE:
 
-1. `mango-worker` опрашивает Mango, параллельно сохраняет аудио в MinIO и метаданные в PostgreSQL.
+1. `mango-worker` опрашивает Mango, проверяет аудио, сохраняет его в MinIO, а метаданные и Kafka outbox — в PostgreSQL.
 2. `transcriber-worker` получает объект MinIO из Kafka, вызывает `gpt-4o-transcribe` через OpenRouter и сохраняет текст.
 3. `quality-worker` анализирует текст через `gpt-4o-mini`, сохраняет метрики и публикует задачу уведомления.
 4. `telegram-worker` отправляет результат основным ботом, а DLQ после третьей ошибки — отдельным ботом.
 
 Каждый Kafka-task содержит `attempt`. При ошибке задача повторно публикуется в исходный topic; после третьей попытки
-создаётся событие `dead_letter`. Записи в PostgreSQL и уведомления идемпотентны.
+создаётся событие `dead_letter`. Первый воркер публикует события через transactional outbox: сохранение звонка и
+постановка событий атомарны, а `dedupe_key` не позволяет повторному lookback создавать новые задачи.
 
 ## Запуск
 
@@ -47,6 +48,7 @@ docker compose ps
 - `quality_scores`: риск, итог, ошибки, рекомендация и шесть метрик.
 - `notifications`: ключи идемпотентности Telegram-событий для каждого `chat_id`.
 - `worker_state`: cursor опроса Mango.
+- `outbox_events`: гарантированная публикация событий первого воркера в Kafka.
 
 Полный результат доступен по `GET /calls/{call_id}`. `GET /health` проверяет PostgreSQL и MinIO.
 
@@ -71,6 +73,7 @@ docker compose exec minio mc ls --recursive local/mango-calls
 docker compose exec postgres psql -U app -d calls -c "select id,status,audio_object_name from calls order by created_at desc limit 10"
 docker compose exec postgres psql -U app -d calls -c "select call_id,left(transcript,80) from transcriptions order by created_at desc limit 10"
 docker compose exec postgres psql -U app -d calls -c "select call_id,score,risk_level from quality_scores order by created_at desc limit 10"
+docker compose exec postgres psql -U app -d calls -c "select id,topic,attempts,last_error from outbox_events where published_at is null order by id"
 docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:9092 --topic calls.dead_letter --from-beginning --max-messages 1
 ```
 
@@ -80,6 +83,7 @@ docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:9092 -
 
 ```bash
 docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations/002_telegram_chat_ids.sql
+docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations/003_outbox.sql
 ```
 
 ## Production

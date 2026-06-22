@@ -21,6 +21,9 @@ from app.common.models import CallRecord
 logger = logging.getLogger(__name__)
 
 _HTTP_RE = re.compile(r"https?://[^\s,;\]]+")
+_AUDIO_CONTENT_TYPES = {
+    "application/ogg",
+}
 
 
 class MangoApiError(RuntimeError):
@@ -114,14 +117,18 @@ class MangoClient:
                 return False
             if "data" in value or "result" in value:
                 return True
-            return not code
+            return "rows" in value or "csv" in value
         if isinstance(value, str):
             return bool(value.strip())
         return True
 
     def _parse_stats_result(self, result: Any, fields: list[str]) -> list[dict[str, Any]]:
         if isinstance(result, dict):
-            payload = result.get("data") or result.get("result") or result.get("rows") or result
+            payload = result
+            for key in ("data", "result", "rows"):
+                if key in result:
+                    payload = result[key]
+                    break
             if isinstance(payload, list):
                 return [dict(row) for row in payload]
             if isinstance(payload, str):
@@ -155,13 +162,19 @@ class MangoClient:
         started_at = self._parse_mango_datetime(self._first(row, "start", "create_time", "started_at"))
         finished_at = self._parse_mango_datetime(self._first(row, "finish", "end_time", "finished_at"))
         generated_id = call_id or entry_id or recording_id or self._stable_fallback_id(row)
+        direction = self._first(row, "call_direction", "direction")
+        if not direction:
+            if self._first(row, "from_extension"):
+                direction = "outgoing"
+            elif self._first(row, "to_extension"):
+                direction = "incoming"
         return CallRecord(
             id=str(generated_id),
             entry_id=entry_id,
             call_id=call_id,
             recording_id=recording_id,
             recording_url=recording_url,
-            direction=self._first(row, "call_direction", "direction"),
+            direction=direction,
             from_number=self._first(row, "from_number", "from.number", "from"),
             to_number=self._first(row, "to_number", "to.number", "to"),
             started_at=started_at,
@@ -227,7 +240,7 @@ class MangoClient:
             response = await self.http.get(recording_url)
             response.raise_for_status()
             filename = self._filename_from_response(response, fallback=f"{recording_id or 'recording'}.mp3")
-            return response.content, filename
+            return self._audio_content(response), filename
 
         if not recording_id:
             raise MangoApiError("No recording_url or recording_id supplied")
@@ -236,14 +249,40 @@ class MangoClient:
         if isinstance(result, str) and result.startswith("http"):
             response = await self.http.get(result)
             response.raise_for_status()
-            return response.content, self._filename_from_response(response, fallback=f"{recording_id}.mp3")
+            filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
+            return self._audio_content(response), filename
         if isinstance(result, dict):
             url = result.get("recording_url") or result.get("url") or result.get("download_url")
             if url:
                 response = await self.http.get(str(url))
                 response.raise_for_status()
-                return response.content, self._filename_from_response(response, fallback=f"{recording_id}.mp3")
+                filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
+                return self._audio_content(response), filename
         raise MangoApiError(f"Cannot resolve Mango recording download URL for {recording_id}: {result!r}")
+
+    @staticmethod
+    def _audio_content(response: httpx.Response) -> bytes:
+        content = response.content
+        if not content:
+            raise MangoApiError("Mango recording response is empty")
+
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        prefix = content[:64].lstrip().lower()
+        if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
+            raise MangoApiError(f"Mango recording returned non-audio Content-Type: {content_type}")
+        if prefix.startswith((b"<!doctype", b"<html", b"<?xml", b"{")):
+            raise MangoApiError("Mango recording returned a document instead of audio")
+
+        has_audio_signature = (
+            content.startswith((b"ID3", b"OggS", b"fLaC", b"\x1aE\xdf\xa3"))
+            or (len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WAVE")
+            or (len(content) >= 8 and content[4:8] == b"ftyp")
+            or (len(content) >= 2 and content[0] == 0xFF and content[1] & 0xE0 == 0xE0)
+        )
+        declared_audio = content_type.startswith(("audio/", "video/")) or content_type in _AUDIO_CONTENT_TYPES
+        if not declared_audio and not has_audio_signature:
+            raise MangoApiError(f"Mango recording has unsupported Content-Type: {content_type or 'missing'}")
+        return content
 
     @staticmethod
     def _filename_from_response(response: httpx.Response, *, fallback: str) -> str:

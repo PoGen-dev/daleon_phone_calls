@@ -48,6 +48,11 @@ def test_settings_parse_fields_and_cache() -> None:
     get_settings.cache_clear()
 
 
+def test_default_mango_fields_include_stable_identity_and_direction() -> None:
+    fields = Settings(_env_file=None).mango_fields_list
+    assert {"entry_id", "call_id", "call_direction", "records"}.issubset(fields)
+
+
 def test_models_normalize_naive_datetime_and_validate_attempt() -> None:
     call = CallRecord(id="1", started_at=datetime(2026, 5, 7, 18))
     assert call.started_at and call.started_at.utcoffset().total_seconds() == 0

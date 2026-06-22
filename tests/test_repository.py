@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.common.models import CallRecord, QualityResult
+from app.common.models import CallRecord, OutboxMessage, QualityResult
 from app.common.repository import Repository, _json, _to_primitive
 
 
@@ -26,6 +26,7 @@ class Connection:
         self.execute = AsyncMock()
         self.fetchrow = AsyncMock()
         self.fetchval = AsyncMock()
+        self.fetch = AsyncMock()
 
     def transaction(self):
         return Context(self)
@@ -152,3 +153,45 @@ async def test_worker_state_operations() -> None:
     assert await repo.get_state("missing") is None
     await repo.set_state("worker", {"cursor": "later"})
     assert conn.execute.await_args.args[1] == "worker"
+
+
+@pytest.mark.asyncio
+async def test_call_and_outbox_are_saved_in_one_transaction() -> None:
+    conn = Connection()
+    repo = Repository(Pool(conn))
+    messages = [
+        OutboxMessage(topic="raw", key="c1", payload={"call_id": "c1"}, dedupe_key="c1:raw"),
+        OutboxMessage(topic="next", key="c1", payload={"call_id": "c1"}, dedupe_key="c1:next"),
+    ]
+    await repo.save_call_and_enqueue(
+        CallRecord(id="c1"),
+        status="recorded",
+        audio_bucket="bucket",
+        audio_object_name="c1/a.mp3",
+        audio_filename="a.mp3",
+        messages=messages,
+    )
+    assert conn.execute.await_count == 3
+    assert conn.execute.await_args_list[1].args[1:] == ("raw", "c1", '{"call_id":"c1"}', "c1:raw")
+
+    await repo.mark_call_failed_and_enqueue("c1", "failed", messages[0])
+    assert conn.execute.await_count == 5
+
+
+@pytest.mark.asyncio
+async def test_outbox_read_and_status_updates() -> None:
+    conn = Connection()
+    repo = Repository(Pool(conn))
+    conn.fetch.return_value = [
+        {"id": 1, "topic": "one", "message_key": "c1", "payload": '{"x":1}', "attempts": 0},
+        {"id": 2, "topic": "two", "message_key": None, "payload": {"x": 2}, "attempts": 1},
+    ]
+    events = await repo.get_pending_outbox(10)
+    assert events[0]["payload"] == {"x": 1}
+    assert events[1]["payload"] == {"x": 2}
+    assert conn.fetch.await_args.args[-1] == 10
+
+    await repo.mark_outbox_published(1)
+    await repo.mark_outbox_failed(2, "kafka down")
+    assert conn.execute.await_args_list[-2].args[1] == 1
+    assert conn.execute.await_args_list[-1].args[1:] == (2, "kafka down")

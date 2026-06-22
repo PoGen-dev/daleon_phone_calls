@@ -70,6 +70,13 @@ class DeadLetterEvent(BaseEvent):
     attempts: int
 
 
+class OutboxMessage(BaseModel):
+    topic: str
+    key: str | None = None
+    payload: dict[str, Any]
+    dedupe_key: str
+
+
 class QualityCriteria(BaseModel):
     greeting: int = Field(ge=0, le=100)
     needs_discovery: int = Field(ge=0, le=100)

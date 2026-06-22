@@ -108,11 +108,12 @@ def test_result_parsing_and_readiness(settings) -> None:
     assert not client._is_result_ready(None)
     assert not client._is_result_ready({"code": 202})
     assert client._is_result_ready({"code": 200, "data": []})
-    assert client._is_result_ready({})
+    assert not client._is_result_ready({})
     assert not client._is_result_ready(" ")
     assert client._is_result_ready("csv") and client._is_result_ready([])
     assert client._extract_key(SimpleNamespace(key="x")) == "x"
     assert client._extract_key({"result": "not-a-dict"}) is None
+    assert client._parse_stats_result({"data": []}, fields) == []
 
 
 def test_row_mapping_urls_dates_and_fallback(settings) -> None:
@@ -141,6 +142,8 @@ def test_row_mapping_urls_dates_and_fallback(settings) -> None:
     assert client._parse_mango_datetime("bad date") is None
     fallback = client._row_to_call({"from_number": "1"})
     assert len(fallback.id) == 32 and fallback.id == client._stable_fallback_id({"from_number": "1"})
+    assert client._row_to_call({"call_id": "out", "from_extension": "101"}).direction == "outgoing"
+    assert client._row_to_call({"call_id": "in", "to_extension": "102"}).direction == "incoming"
 
 
 @pytest.mark.asyncio
@@ -150,17 +153,42 @@ async def test_download_recording_all_supported_responses(settings) -> None:
     client.http = SimpleNamespace(
         get=AsyncMock(
             side_effect=[
-                Response(content=b"one", headers={"content-disposition": 'attachment; filename="call.wav"'}),
-                Response(content=b"two"),
-                Response(content=b"three"),
+                Response(
+                    content=b"RIFF0000WAVEone",
+                    headers={"content-disposition": 'attachment; filename="call.wav"'},
+                ),
+                Response(content=b"ID3two"),
+                Response(content=b"OggSthree"),
             ]
         )
     )
-    assert await client.download_recording(recording_url="https://a", recording_id=None) == (b"one", "call.wav")
+    assert await client.download_recording(recording_url="https://a", recording_id=None) == (
+        b"RIFF0000WAVEone",
+        "call.wav",
+    )
     client.request = AsyncMock(side_effect=["https://b", {"download_url": "https://c"}, {}])
-    assert await client.download_recording(recording_url=None, recording_id="r2") == (b"two", "r2.mp3")
-    assert await client.download_recording(recording_url=None, recording_id="r3") == (b"three", "r3.mp3")
+    assert await client.download_recording(recording_url=None, recording_id="r2") == (b"ID3two", "r2.mp3")
+    assert await client.download_recording(recording_url=None, recording_id="r3") == (b"OggSthree", "r3.mp3")
     with pytest.raises(MangoApiError, match="Cannot resolve"):
         await client.download_recording(recording_url=None, recording_id="r4")
     with pytest.raises(MangoApiError, match="No recording"):
         await client.download_recording(recording_url=None, recording_id=None)
+
+
+@pytest.mark.parametrize(
+    ("content", "headers", "message"),
+    [
+        (b"", {}, "empty"),
+        (b"<html>player</html>", {"content-type": "text/html"}, "non-audio"),
+        (b'{"error":"denied"}', {"content-type": "application/octet-stream"}, "document"),
+        (b"unknown", {}, "unsupported"),
+    ],
+)
+def test_recording_content_validation(content, headers, message) -> None:
+    with pytest.raises(MangoApiError, match=message):
+        MangoClient._audio_content(Response(content=content, headers=headers))
+
+
+def test_recording_content_accepts_declared_audio() -> None:
+    response = Response(content=b"opaque audio", headers={"content-type": "audio/mpeg; charset=binary"})
+    assert MangoClient._audio_content(response) == b"opaque audio"

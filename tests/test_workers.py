@@ -43,81 +43,102 @@ def quality() -> QualityResult:
     )
 
 
-def test_parse_cursor() -> None:
+def test_cursor_and_poll_windows(settings) -> None:
     assert mango_worker._parse_cursor(None) is None
     assert mango_worker._parse_cursor("2026-01-01T00:00:00Z").tzinfo is not None
     assert mango_worker._safe_component("../bad/id", "fallback") == "_bad_id"
     assert mango_worker._safe_component("...", "fallback") == "fallback"
+    now = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+    assert mango_worker._poll_window(None, now, settings) == (
+        datetime(2026, 1, 1, 11, 55, tzinfo=timezone.utc),
+        now,
+    )
+    assert mango_worker._poll_window(datetime(2026, 1, 1, 11, tzinfo=timezone.utc), now, settings) == (
+        datetime(2026, 1, 1, 10, 55, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 11, 5, tzinfo=timezone.utc),
+    )
 
 
 @pytest.mark.asyncio
-async def test_mango_store_downloads_uploads_and_publishes(settings, monkeypatch) -> None:
+async def test_mango_store_downloads_uploads_and_enqueues(settings) -> None:
     repo = SimpleNamespace(
-        save_call=AsyncMock(), get_call=AsyncMock(return_value=None), mark_call_status=AsyncMock()
+        save_call=AsyncMock(),
+        get_call=AsyncMock(return_value=None),
+        save_call_and_enqueue=AsyncMock(),
     )
     mango = SimpleNamespace(download_recording=AsyncMock(return_value=(b"audio", "../call.mp3")))
-    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock())
-    publish = AsyncMock()
-    monkeypatch.setattr(mango_worker, "publish_json", publish)
-    producer = object()
-    await mango_worker._store_call(
-        call(), repo=repo, mango=mango, storage=storage, producer=producer, settings=settings
-    )
+    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock(), remove=AsyncMock())
+    await mango_worker._store_call(call(), repo=repo, mango=mango, storage=storage, settings=settings)
     storage.upload.assert_awaited_once_with("c1/call.mp3", b"audio", content_type="audio/mpeg")
-    assert repo.save_call.await_count == 2
-    assert publish.await_count == 2
-    assert publish.await_args_list[1].args[1] == settings.topic_to_transcribe
-    assert publish.await_args_list[1].args[2]["object_name"] == "c1/call.mp3"
+    assert repo.save_call.await_count == 1
+    kwargs = repo.save_call_and_enqueue.await_args.kwargs
+    assert kwargs["audio_object_name"] == "c1/call.mp3"
+    assert [message.topic for message in kwargs["messages"]] == [
+        settings.topic_mango_raw,
+        settings.topic_to_transcribe,
+    ]
+    assert kwargs["messages"][1].payload["object_name"] == "c1/call.mp3"
 
 
 @pytest.mark.asyncio
-async def test_mango_store_is_idempotent_and_handles_no_recording(settings, monkeypatch) -> None:
+async def test_mango_store_is_idempotent_and_handles_no_recording(settings) -> None:
     repo = SimpleNamespace(
         save_call=AsyncMock(),
         get_call=AsyncMock(return_value={"audio_object_name": "c1/old.wav", "audio_filename": "old.wav"}),
         mark_call_status=AsyncMock(),
+        save_call_and_enqueue=AsyncMock(),
     )
     mango = SimpleNamespace(download_recording=AsyncMock())
-    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock())
-    publish = AsyncMock()
-    monkeypatch.setattr(mango_worker, "publish_json", publish)
-    await mango_worker._store_call(
-        call(), repo=repo, mango=mango, storage=storage, producer=object(), settings=settings
-    )
+    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock(), remove=AsyncMock())
+    await mango_worker._store_call(call(), repo=repo, mango=mango, storage=storage, settings=settings)
     mango.download_recording.assert_not_awaited()
-    assert publish.await_args_list[1].args[2]["filename"] == "old.wav"
+    messages = repo.save_call_and_enqueue.await_args.kwargs["messages"]
+    assert messages[1].payload["filename"] == "old.wav"
 
-    publish.reset_mock()
     await mango_worker._store_call(
         call(recording_id=None, recording_url=None),
         repo=repo,
         mango=mango,
         storage=storage,
-        producer=object(),
         settings=settings,
     )
     repo.mark_call_status.assert_awaited_with(
         "c1", "no_recording", "Mango payload contains no recording reference"
     )
-    publish.assert_not_awaited()
+    assert repo.save_call_and_enqueue.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_mango_ingestion_retries_three_times_then_dlq(settings, monkeypatch) -> None:
+async def test_mango_ingestion_retries_three_times_then_enqueues_dlq(settings) -> None:
     repo = SimpleNamespace(
-        save_call=AsyncMock(), get_call=AsyncMock(return_value=None), mark_call_status=AsyncMock()
+        save_call=AsyncMock(),
+        get_call=AsyncMock(return_value=None),
+        mark_call_failed_and_enqueue=AsyncMock(),
     )
     mango = SimpleNamespace(download_recording=AsyncMock(side_effect=RuntimeError("download failed")))
-    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock())
-    publish = AsyncMock()
-    monkeypatch.setattr(mango_worker, "publish_json", publish)
+    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock(), remove=AsyncMock())
     await mango_worker._store_call_with_retries(
-        call(), repo=repo, mango=mango, storage=storage, producer=object(), settings=settings
+        call(), repo=repo, mango=mango, storage=storage, settings=settings
     )
     assert mango.download_recording.await_count == 3
-    repo.mark_call_status.assert_awaited_once_with("c1", "ingestion_failed", "download failed")
-    assert publish.await_args.args[1] == settings.topic_dead_letter
-    assert publish.await_args.args[2]["attempts"] == 3
+    args = repo.mark_call_failed_and_enqueue.await_args.args
+    assert args[:2] == ("c1", "download failed")
+    assert args[2].topic == settings.topic_dead_letter
+    assert args[2].payload["attempts"] == 3
+
+
+@pytest.mark.asyncio
+async def test_mango_removes_new_object_when_database_transaction_fails(settings) -> None:
+    repo = SimpleNamespace(
+        save_call=AsyncMock(),
+        get_call=AsyncMock(return_value=None),
+        save_call_and_enqueue=AsyncMock(side_effect=RuntimeError("database down")),
+    )
+    mango = SimpleNamespace(download_recording=AsyncMock(return_value=(b"audio", "call.mp3")))
+    storage = SimpleNamespace(bucket="bucket", upload=AsyncMock(), remove=AsyncMock())
+    with pytest.raises(RuntimeError, match="database down"):
+        await mango_worker._store_call(call(), repo=repo, mango=mango, storage=storage, settings=settings)
+    storage.remove.assert_awaited_once_with("c1/call.mp3")
 
 
 @pytest.mark.asyncio

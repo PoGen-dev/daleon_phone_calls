@@ -28,6 +28,7 @@ async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -
         make_bucket=MagicMock(),
         put_object=MagicMock(),
         get_object=MagicMock(return_value=response),
+        remove_object=MagicMock(),
     )
     constructor = MagicMock(return_value=client)
     monkeypatch.setattr("app.clients.minio.Minio", constructor)
@@ -38,6 +39,8 @@ async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -
     assert args[:2] == ("mango-calls", "c/a.mp3") and args[4] == 3
     assert await storage.download("c/a.mp3") == b"audio"
     response.close.assert_called_once()
+    await storage.remove("c/a.mp3")
+    client.remove_object.assert_called_once_with("mango-calls", "c/a.mp3")
     assert await storage.is_available()
     assert not await storage.is_available()
     constructor.assert_called_once()
@@ -191,5 +194,19 @@ async def test_postgres_context_closes_pool(settings, monkeypatch) -> None:
     monkeypatch.setattr(db.asyncpg, "create_pool", create_pool)
     async with db.postgres_pool(settings) as yielded:
         assert yielded is pool
-    create_pool.assert_awaited_once_with(dsn=settings.postgres_dsn, min_size=1, max_size=10)
+    create_pool.assert_awaited_once_with(
+        dsn=settings.postgres_dsn,
+        min_size=1,
+        max_size=10,
+        init=db._configure_connection,
+    )
     pool.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_postgres_connection_decodes_json() -> None:
+    conn = SimpleNamespace(set_type_codec=AsyncMock())
+    await db._configure_connection(conn)
+    assert [call.args[0] for call in conn.set_type_codec.await_args_list] == ["json", "jsonb"]
+    decoder = conn.set_type_codec.await_args.kwargs["decoder"]
+    assert decoder('{"cursor":"now"}') == {"cursor": "now"}
