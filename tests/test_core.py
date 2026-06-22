@@ -48,9 +48,10 @@ def test_settings_parse_fields_and_cache() -> None:
     get_settings.cache_clear()
 
 
-def test_default_mango_fields_include_stable_identity_and_direction() -> None:
+def test_default_mango_fields_match_supported_report_columns() -> None:
     fields = Settings(_env_file=None).mango_fields_list
-    assert {"entry_id", "call_id", "call_direction", "records"}.issubset(fields)
+    assert {"entry_id", "records", "answer", "line_number", "location"}.issubset(fields)
+    assert "call_id" not in fields and "call_direction" not in fields
 
 
 def test_models_normalize_naive_datetime_and_validate_attempt() -> None:

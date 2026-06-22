@@ -39,17 +39,17 @@ class Settings(BaseSettings):
     mango_api_salt: SecretStr = Field(default=SecretStr(""))
     mango_stats_request_endpoint: str = "stats/request"
     mango_stats_result_endpoint: str = "stats/result"
-    mango_recording_download_endpoint: str = "records/{recording_id}"
+    mango_recording_download_endpoint: str = "queries/recording/post/"
     mango_poll_interval_seconds: int = 30
     mango_catchup_interval_seconds: float = Field(default=1.0, ge=0)
     mango_lookback_seconds: int = 300
     mango_request_window_seconds: int = 300
-    mango_result_poll_attempts: int = 12
+    mango_result_poll_attempts: int = 60
     mango_result_poll_interval_seconds: int = 5
     mango_worker_concurrency: int = Field(default=4, ge=1)
     mango_stats_fields: Annotated[str, Field(description="Comma-separated Mango stats fields")] = (
-        "entry_id,call_id,call_direction,records,start,finish,"
-        "from_extension,from_number,to_extension,to_number,disconnect_reason"
+        "records,start,finish,answer,from_extension,from_number,to_extension,"
+        "to_number,disconnect_reason,line_number,location,entry_id"
     )
     mango_default_timezone: str = "Europe/Moscow"
 

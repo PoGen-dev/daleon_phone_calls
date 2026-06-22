@@ -9,7 +9,6 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
 import httpx
 from dateutil import parser as dt_parser
@@ -37,7 +36,12 @@ class MangoClient:
         self.api_key = settings.mango_api_key.get_secret_value()
         self.api_salt = settings.mango_api_salt.get_secret_value()
         self.tz = ZoneInfo(settings.mango_default_timezone)
-        self.http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=90.0), follow_redirects=True)
+        transport = httpx.AsyncHTTPTransport(retries=3)
+        self.http = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, read=90.0),
+            follow_redirects=True,
+            transport=transport,
+        )
 
     async def aclose(self) -> None:
         await self.http.aclose()
@@ -51,7 +55,7 @@ class MangoClient:
     def _json_dumps(payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
-    async def request(self, endpoint: str, payload: dict[str, Any]) -> Any:
+    async def _post(self, endpoint: str, payload: dict[str, Any]) -> httpx.Response:
         if not self.api_key or not self.api_salt:
             raise MangoApiError("MANGO_API_KEY/MANGO_API_SALT are required")
         json_payload, sign = self.sign(payload)
@@ -62,6 +66,14 @@ class MangoClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         response.raise_for_status()
+        return response
+
+    async def request(self, endpoint: str, payload: dict[str, Any]) -> Any:
+        response = await self._post(endpoint, payload)
+        return self._decode_response(response)
+
+    @staticmethod
+    def _decode_response(response: httpx.Response) -> Any:
         content_type = response.headers.get("content-type", "")
         if "application/json" in content_type:
             return response.json()
@@ -75,31 +87,44 @@ class MangoClient:
 
     async def fetch_calls(self, date_from: datetime, date_to: datetime) -> list[CallRecord]:
         fields = self.settings.mango_fields_list
-        request_id = str(uuid4())
         request_payload = {
             "date_from": int(date_from.timestamp()),
             "date_to": int(date_to.timestamp()),
             "fields": ",".join(fields),
-            "request_id": request_id,
         }
         initial = await self.request(self.settings.mango_stats_request_endpoint, request_payload)
         key = self._extract_key(initial)
         if not key:
             raise MangoApiError(f"Mango stats/request did not return key: {initial!r}")
 
-        result_payload = {"key": key, "request_id": request_id}
+        result_payload = self._stats_result_payload(initial, key)
         result: Any = None
         for attempt in range(1, self.settings.mango_result_poll_attempts + 1):
             result = await self.request(self.settings.mango_stats_result_endpoint, result_payload)
             if self._is_result_ready(result):
                 break
-            logger.info("Mango stats result is not ready", extra={"attempt": attempt, "result": result})
+            logger.info(
+                "Mango stats result is not ready: attempt=%s/%s result=%r",
+                attempt,
+                self.settings.mango_result_poll_attempts,
+                result,
+            )
             await asyncio.sleep(self.settings.mango_result_poll_interval_seconds)
         else:
             raise MangoApiError(f"Mango stats/result is not ready after polling: {result!r}")
 
         rows = self._parse_stats_result(result, fields)
         return [self._row_to_call(row) for row in rows]
+
+    @staticmethod
+    def _stats_result_payload(initial: Any, key: str) -> dict[str, Any]:
+        if isinstance(initial, dict):
+            nested = initial.get("result")
+            if isinstance(nested, dict) and nested.get("key"):
+                return dict(nested)
+            if initial.get("key"):
+                return dict(initial)
+        return {"key": key}
 
     def _extract_key(self, value: Any) -> str | None:
         if isinstance(value, dict):
@@ -245,7 +270,12 @@ class MangoClient:
         if not recording_id:
             raise MangoApiError("No recording_url or recording_id supplied")
         endpoint = self.settings.mango_recording_download_endpoint.format(recording_id=recording_id)
-        result = await self.request(endpoint, {"recording_id": recording_id})
+        response = await self._post(endpoint, {"recording_id": recording_id, "action": "download"})
+        try:
+            filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
+            return self._audio_content(response), filename
+        except MangoApiError:
+            result = self._decode_response(response)
         if isinstance(result, str) and result.startswith("http"):
             response = await self.http.get(result)
             response.raise_for_status()

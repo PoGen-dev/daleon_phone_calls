@@ -62,9 +62,10 @@ async def test_request_handles_json_text_empty_and_missing_credentials(settings)
 async def test_fetch_calls_polls_until_ready(settings, monkeypatch) -> None:
     settings.mango_stats_fields = "call_id,records,start,finish"
     client = MangoClient(settings)
+    initial = {"result": {"key": "report-key", "expires": 1710000300}}
     client.request = AsyncMock(
         side_effect=[
-            {"result": {"key": "report-key"}},
+            initial,
             {"code": 202},
             {"data": [{"call_id": "c1", "records": "r1", "start": "1710000000"}]},
         ]
@@ -76,6 +77,10 @@ async def test_fetch_calls_polls_until_ready(settings, monkeypatch) -> None:
         datetime(2026, 1, 2, tzinfo=timezone.utc),
     )
     assert calls[0].id == "c1" and calls[0].recording_id == "r1"
+    request_payload = client.request.await_args_list[0].args[1]
+    result_payload = client.request.await_args_list[1].args[1]
+    assert "request_id" not in request_payload
+    assert result_payload == initial["result"]
     sleep.assert_awaited_once()
     await client.aclose()
 
@@ -113,6 +118,12 @@ def test_result_parsing_and_readiness(settings) -> None:
     assert client._is_result_ready("csv") and client._is_result_ready([])
     assert client._extract_key(SimpleNamespace(key="x")) == "x"
     assert client._extract_key({"result": "not-a-dict"}) is None
+    assert client._stats_result_payload({"key": "k", "expires": 1}, "k") == {"key": "k", "expires": 1}
+    assert client._stats_result_payload({"result": {"key": "k", "expires": 1}}, "k") == {
+        "key": "k",
+        "expires": 1,
+    }
+    assert client._stats_result_payload("unexpected", "k") == {"key": "k"}
     assert client._parse_stats_result({"data": []}, fields) == []
 
 
@@ -157,7 +168,6 @@ async def test_download_recording_all_supported_responses(settings) -> None:
                     content=b"RIFF0000WAVEone",
                     headers={"content-disposition": 'attachment; filename="call.wav"'},
                 ),
-                Response(content=b"ID3two"),
                 Response(content=b"OggSthree"),
             ]
         )
@@ -166,9 +176,18 @@ async def test_download_recording_all_supported_responses(settings) -> None:
         b"RIFF0000WAVEone",
         "call.wav",
     )
-    client.request = AsyncMock(side_effect=["https://b", {"download_url": "https://c"}, {}])
+    client._post = AsyncMock(
+        side_effect=[
+            Response(content=b"ID3two"),
+            Response(data={"download_url": "https://c"}, headers={"content-type": "application/json"}),
+            Response(data={}, headers={"content-type": "application/json"}),
+        ]
+    )
     assert await client.download_recording(recording_url=None, recording_id="r2") == (b"ID3two", "r2.mp3")
     assert await client.download_recording(recording_url=None, recording_id="r3") == (b"OggSthree", "r3.mp3")
+    endpoint, payload = client._post.await_args_list[0].args
+    assert endpoint == "queries/recording/post/"
+    assert payload == {"recording_id": "r2", "action": "download"}
     with pytest.raises(MangoApiError, match="Cannot resolve"):
         await client.download_recording(recording_url=None, recording_id="r4")
     with pytest.raises(MangoApiError, match="No recording"):

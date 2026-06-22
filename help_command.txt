@@ -1,0 +1,6 @@
+docker compose config
+docker compose up --build -d
+docker compose ps
+
+
+env\Scripts\pytest -q

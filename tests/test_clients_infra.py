@@ -36,7 +36,7 @@ async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -
     await storage.upload("c/a.mp3", b"123", content_type="audio/mpeg")
     client.make_bucket.assert_called_once_with("mango-calls")
     args = client.put_object.call_args.args
-    assert args[:2] == ("mango-calls", "c/a.mp3") and args[4] == 3
+    assert args[:2] == ("mango-calls", "c/a.mp3") and args[3] == 3
     assert await storage.download("c/a.mp3") == b"audio"
     response.close.assert_called_once()
     await storage.remove("c/a.mp3")
