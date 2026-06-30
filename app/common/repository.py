@@ -211,8 +211,10 @@ class Repository:
             row = await conn.fetchrow(
                 """
                 SELECT c.*, t.transcript, t.model AS transcription_model,
-                    t.language AS transcription_language, q.score, q.risk_level, q.risk_reason,
-                    q.summary, q.errors, q.recommendation, q.criteria, q.model AS quality_model
+                    t.language AS transcription_language, t.raw AS transcription_raw,
+                    q.score, q.risk_level, q.risk_reason,
+                    q.summary, q.errors, q.recommendation, q.criteria,
+                    q.model AS quality_model, q.raw AS quality_raw
                 FROM calls c
                 LEFT JOIN transcriptions t ON t.call_id = c.id
                 LEFT JOIN quality_scores q ON q.call_id = c.id

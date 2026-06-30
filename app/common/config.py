@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     openrouter_app_name: str = "Mango Transcribe Analysis"
     openai_transcribe_model: str = "openai/gpt-4o-transcribe"
     openai_transcribe_language: str | None = "ru"
+    openai_transcript_role_model: str | None = "openai/gpt-4o-mini"
     openai_quality_model: str = "openai/gpt-4o-mini"
     openai_quality_temperature: float = 0.0
 

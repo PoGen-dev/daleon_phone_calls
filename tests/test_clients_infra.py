@@ -9,7 +9,9 @@ from app.clients.minio import MinioStorage
 from app.clients.openai_qa import QUALITY_JSON_SCHEMA, OpenAIQaClient
 from app.clients.telegram import TelegramClient
 from app.common import db, kafka
+from app.common.models import QualityResult
 from app.common.retry import retry_or_dead_letter
+from app.prompts.quality import QUALITY_SYSTEM_PROMPT
 
 
 class Dumpable:
@@ -77,6 +79,8 @@ async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch) -
         "summary": "Обсудили услугу",
         "errors": ["Не назначена дата"],
         "recommendation": "Перезвонить",
+        "analysis_confidence": "low",
+        "limitations": ["Недостаточно реплик"],
         "criteria": {
             "greeting": 90,
             "needs_discovery": 80,
@@ -85,6 +89,24 @@ async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch) -
             "objection_handling": 75,
             "closing": 50,
         },
+        "criteria_status": {
+            "greeting": "not_observed",
+            "needs_discovery": "not_observed",
+            "urgency": "not_observed",
+            "target_action": "not_observed",
+            "objection_handling": "not_observed",
+            "closing": "not_observed",
+        },
+        "criteria_evidence": {
+            "greeting": [],
+            "needs_discovery": [],
+            "urgency": [],
+            "target_action": [],
+            "objection_handling": [],
+            "closing": [],
+        },
+        "objections": [],
+        "next_step": {"status": "absent", "quote": None},
     }
     completion = Dumpable({"choices": []})
     completion.choices = [SimpleNamespace(message=SimpleNamespace(content=__import__("json").dumps(quality)))]
@@ -105,7 +127,7 @@ async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch) -
     text, raw = await ai.transcribe(audio=b"audio", filename="call.mp3")
     result, response = await ai.score_quality(transcript="текст")
     assert text == "привет" and raw["text"] == "привет"
-    assert result.score == 80 and response == {"choices": []}
+    assert result.score == 0 and response["quality_control"]["model_score"] == 80
     kwargs = constructor.call_args.kwargs
     assert kwargs["base_url"] == settings.openrouter_base_url
     assert kwargs["default_headers"]["HTTP-Referer"] == "https://app.example"
@@ -149,6 +171,10 @@ async def test_openrouter_transcription_fallback_and_empty_completion(settings, 
         ("recording", b"RIFF0000WAVEaudio", "wav"),
         ("recording.mp3", b"RIFF0000WAVEaudio", "wav"),
         ("recording", b"ID3audio", "mp3"),
+        ("recording", b"OggSaudio", "ogg"),
+        ("recording", b"fLaCaudio", "flac"),
+        ("recording", b"0000ftypaudio", "m4a"),
+        ("recording", b"\x1aE\xdf\xa3audio", "webm"),
         ("call.oga", b"audio", "ogg"),
         ("call.mp4", b"audio", "m4a"),
     ],
@@ -160,6 +186,206 @@ def test_openrouter_detects_audio_format(filename, audio, expected) -> None:
 def test_openrouter_rejects_unknown_audio_format() -> None:
     with pytest.raises(ValueError, match="Cannot determine"):
         OpenAIQaClient._audio_format("recording.bin", b"unknown")
+
+
+@pytest.mark.asyncio
+async def test_transcript_roles_preserve_every_source_word(settings, monkeypatch) -> None:
+    content = (
+        '{"turns":[{"speaker":"manager","text":"Здравствуйте"},'
+        '{"speaker":"client","text":"Мне дорого"}]}'
+    )
+    completion = Dumpable({"choices": []})
+    completion.choices = [SimpleNamespace(message=SimpleNamespace(content=content))]
+    fake = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
+        close=AsyncMock(),
+    )
+    stt_http = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
+    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
+    ai = OpenAIQaClient(settings)
+
+    transcript, raw = await ai.structure_transcript("Здравствуйте. Мне дорого.")
+
+    assert transcript == "Менеджер: Здравствуйте\nКлиент: Мне дорого"
+    assert raw["validated"] is True
+    await ai.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transcript_roles_fall_back_when_model_invents_words(settings, monkeypatch) -> None:
+    content = '{"turns":[{"speaker":"manager","text":"Здравствуйте уважаемый клиент"}]}'
+    completion = Dumpable({"choices": []})
+    completion.choices = [SimpleNamespace(message=SimpleNamespace(content=content))]
+    fake = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
+        close=AsyncMock(),
+    )
+    stt_http = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
+    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
+    ai = OpenAIQaClient(settings)
+
+    transcript, raw = await ai.structure_transcript("Здравствуйте")
+
+    assert transcript == "Спикер не определён: Здравствуйте"
+    assert raw["validated"] is False
+    await ai.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transcript_roles_can_be_disabled(settings, monkeypatch) -> None:
+    fake = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock())),
+        close=AsyncMock(),
+    )
+    stt_http = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
+    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
+    settings.openai_transcript_role_model = None
+    ai = OpenAIQaClient(settings)
+
+    transcript, raw = await ai.structure_transcript("Исходный текст")
+
+    assert transcript == "Спикер не определён: Исходный текст"
+    assert raw == {"enabled": False, "validated": True}
+    fake.chat.completions.create.assert_not_awaited()
+    await ai.aclose()
+
+
+def test_quality_control_rejects_nonexistent_quotes_and_recalculates_score() -> None:
+    payload = {
+        "score": 1,
+        "risk_level": "warning",
+        "risk_reason": "Нет следующего шага",
+        "summary": "Клиент считает цену высокой.",
+        "errors": ["Не уточнена причина возражения"],
+        "recommendation": "Уточнить причину сомнения.",
+        "analysis_confidence": "high",
+        "limitations": [],
+        "criteria": {
+            name: 50
+            for name in (
+                "greeting",
+                "needs_discovery",
+                "urgency",
+                "target_action",
+                "objection_handling",
+                "closing",
+            )
+        },
+        "criteria_status": {
+            "greeting": "observed",
+            "needs_discovery": "not_observed",
+            "urgency": "not_observed",
+            "target_action": "not_observed",
+            "objection_handling": "observed",
+            "closing": "not_observed",
+        },
+        "criteria_evidence": {
+            "greeting": ["Здравствуйте"],
+            "needs_discovery": [],
+            "urgency": [],
+            "target_action": [],
+            "objection_handling": ["Мне дорого"],
+            "closing": [],
+        },
+        "objections": [
+            {
+                "customer_quote": "Мне дорого",
+                "kind": "explicit",
+                "category": "price",
+                "manager_response_quote": None,
+                "completed_steps": [],
+                "missing_steps": ["clarified", "answered", "checked_resolution", "agreed_next_step"],
+                "resolution": "unresolved",
+            }
+        ],
+        "next_step": {"status": "absent", "quote": None},
+    }
+    quality = QualityResult.model_validate(payload)
+    transcript = "Менеджер: Здравствуйте. Клиент: Мне дорого."
+
+    OpenAIQaClient._validate_quality_evidence(quality, transcript)
+    quality = OpenAIQaClient._normalize_criteria_scores(quality)
+    assert quality.criteria.needs_discovery == 0
+    assert OpenAIQaClient._compute_quality_score(quality) == 15
+
+    payload["criteria_evidence"]["greeting"] = []
+    with pytest.raises(ValueError, match="has no evidence"):
+        OpenAIQaClient._validate_quality_evidence(QualityResult.model_validate(payload), transcript)
+
+    payload["criteria_evidence"]["greeting"] = ["Здравствуйте"]
+    payload["objections"][0]["customer_quote"] = "Такого клиент не говорил"
+    with pytest.raises(ValueError, match="unsupported quote"):
+        OpenAIQaClient._validate_quality_evidence(QualityResult.model_validate(payload), transcript)
+
+
+def test_quality_prompt_contains_grounded_sales_rubric() -> None:
+    assert "установление контакта" in QUALITY_SYSTEM_PROMPT
+    assert "проверил ли удобство разговора" in QUALITY_SYSTEM_PROMPT
+    assert "выяснены сроки, дедлайны и срочность" in QUALITY_SYSTEM_PROMPT
+    assert "звонок продающий" in QUALITY_SYSTEM_PROMPT
+    assert "неотработанный soft_deferral" in QUALITY_SYSTEM_PROMPT
+    assert "не утверждай скрытую причину" in QUALITY_SYSTEM_PROMPT
+
+
+def test_quality_control_rejects_unsupported_critical_risk() -> None:
+    payload = {
+        "score": 90,
+        "risk_level": "critical",
+        "risk_reason": "Риск не подтверждён",
+        "summary": "Клиент согласился на следующий шаг.",
+        "errors": [],
+        "recommendation": "Продолжить по договорённости.",
+        "criteria": {
+            "greeting": 90,
+            "needs_discovery": 90,
+            "urgency": 80,
+            "target_action": 90,
+            "objection_handling": 50,
+            "closing": 90,
+        },
+        "analysis_confidence": "high",
+        "limitations": [],
+        "criteria_status": {
+            "greeting": "observed",
+            "needs_discovery": "observed",
+            "urgency": "observed",
+            "target_action": "observed",
+            "objection_handling": "not_applicable",
+            "closing": "observed",
+        },
+        "criteria_evidence": {
+            "greeting": ["Здравствуйте"],
+            "needs_discovery": ["Что нужно сделать"],
+            "urgency": ["До пятницы"],
+            "target_action": ["Давайте так"],
+            "objection_handling": [],
+            "closing": ["Давайте так"],
+        },
+        "objections": [],
+        "next_step": {"status": "agreed", "quote": "Давайте так"},
+    }
+    with pytest.raises(ValueError, match="next step is agreed"):
+        OpenAIQaClient._validate_risk_consistency(QualityResult.model_validate(payload))
+
+    payload["next_step"] = {"status": "absent", "quote": None}
+    with pytest.raises(ValueError, match="requires an unresolved"):
+        OpenAIQaClient._validate_risk_consistency(QualityResult.model_validate(payload))
+
+    payload["objections"] = [
+        {
+            "customer_quote": "Я подумаю",
+            "kind": "soft_deferral",
+            "category": "other",
+            "manager_response_quote": None,
+            "completed_steps": [],
+            "missing_steps": ["clarified", "answered", "checked_resolution", "agreed_next_step"],
+            "resolution": "unresolved",
+        }
+    ]
+    OpenAIQaClient._validate_risk_consistency(QualityResult.model_validate(payload))
 
 
 @pytest.mark.asyncio

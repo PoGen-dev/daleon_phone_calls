@@ -162,7 +162,12 @@ async def test_transcriber_processes_audio_and_continues_idempotently(settings, 
         save_transcription=AsyncMock(),
     )
     storage = SimpleNamespace(download=AsyncMock(return_value=b"audio"))
-    ai = SimpleNamespace(transcribe=AsyncMock(return_value=("готовый текст", {"language": "ru"})))
+    ai = SimpleNamespace(
+        transcribe=AsyncMock(return_value=("готовый текст", {"language": "ru"})),
+        structure_transcript=AsyncMock(
+            return_value=("Клиент: готовый текст", {"validated": True, "turns": []})
+        ),
+    )
     publish = AsyncMock()
     monkeypatch.setattr(transcriber_worker, "publish_json", publish)
     payload = {"call_id": "c1", "object_name": "c1/a.mp3", "filename": "a.mp3"}
@@ -170,6 +175,10 @@ async def test_transcriber_processes_audio_and_continues_idempotently(settings, 
         payload, repo=repo, storage=storage, ai=ai, producer=object(), settings=settings
     )
     repo.save_transcription.assert_awaited_once()
+    saved = repo.save_transcription.await_args.kwargs
+    assert saved["transcript"] == "Клиент: готовый текст"
+    assert saved["language"] == "ru"
+    assert saved["raw"]["source_text"] == "готовый текст"
     assert publish.await_args.args[1] == settings.topic_to_analyze
     await transcriber_worker.process_task(
         payload, repo=repo, storage=storage, ai=ai, producer=object(), settings=settings

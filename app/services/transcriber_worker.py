@@ -34,13 +34,28 @@ async def process_task(
         if not object_name:
             raise ValueError("Kafka payload has no MinIO object_name")
         audio = await storage.download(object_name)
-        transcript, raw = await ai.transcribe(audio=audio, filename=payload.get("filename") or "recording.mp3")
-        if not transcript.strip():
-            raise ValueError("Transcription returned empty text")
-        await repo.save_transcription(
-            call_id=call_id, transcript=transcript, model=settings.openai_transcribe_model, raw=raw
+        source_transcript, raw = await ai.transcribe(
+            audio=audio,
+            filename=payload.get("filename") or "recording.mp3",
         )
-        logger.info("Call transcribed", extra={"call_id": call_id, "chars": len(transcript)})
+        if not source_transcript.strip():
+            raise ValueError("Transcription returned empty text")
+        transcript, role_raw = await ai.structure_transcript(source_transcript)
+        raw["source_text"] = source_transcript
+        raw["role_structuring"] = role_raw
+        await repo.save_transcription(
+            call_id=call_id,
+            transcript=transcript,
+            model=settings.openai_transcribe_model,
+            language=settings.openai_transcribe_language,
+            raw=raw,
+        )
+        logger.info(
+            "Call transcribed: call_id=%s chars=%s roles_validated=%s",
+            call_id,
+            len(transcript),
+            role_raw.get("validated"),
+        )
     event = AnalysisRequestedEvent(call_id=call_id)
     await publish_json(producer, settings.topic_to_analyze, event.model_dump(mode="json"), key=call_id)
 
