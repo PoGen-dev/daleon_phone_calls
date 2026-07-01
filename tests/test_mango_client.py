@@ -62,6 +62,28 @@ async def test_request_handles_json_text_empty_and_missing_credentials(settings)
 
 
 @pytest.mark.asyncio
+async def test_request_retries_mango_rate_limit(settings, monkeypatch) -> None:
+    settings.retry_backoff_seconds = 2
+    client = MangoClient(settings)
+    await client.http.aclose()
+    client.http = SimpleNamespace(
+        post=AsyncMock(
+            side_effect=[
+                Response(status_code=429, headers={"retry-after": "3"}),
+                Response(data={"ok": True}, headers={"content-type": "application/json"}),
+            ]
+        )
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr("app.clients.mango.asyncio.sleep", sleep)
+
+    assert await client.request("stats", {}) == {"ok": True}
+
+    assert client.http.post.await_count == 2
+    sleep.assert_awaited_once_with(3.0)
+
+
+@pytest.mark.asyncio
 async def test_fetch_calls_polls_until_ready(settings, monkeypatch) -> None:
     settings.mango_stats_fields = "call_id,records,start,finish"
     client = MangoClient(settings)

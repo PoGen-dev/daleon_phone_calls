@@ -24,6 +24,7 @@ class Dumpable:
 
 @pytest.mark.asyncio
 async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -> None:
+    settings.minio_public_base_url = "https://files.example.test/minio"
     response = SimpleNamespace(read=MagicMock(return_value=b"audio"), close=MagicMock(), release_conn=MagicMock())
     client = SimpleNamespace(
         bucket_exists=MagicMock(side_effect=[False, True, RuntimeError("down")]),
@@ -31,6 +32,9 @@ async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -
         put_object=MagicMock(),
         get_object=MagicMock(return_value=response),
         remove_object=MagicMock(),
+        presigned_get_object=MagicMock(
+            return_value="http://minio:9000/mango-calls/c/a.mp3?X-Amz-Signature=abc"
+        ),
     )
     constructor = MagicMock(return_value=client)
     monkeypatch.setattr("app.clients.minio.Minio", constructor)
@@ -43,6 +47,11 @@ async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -
     response.close.assert_called_once()
     await storage.remove("c/a.mp3")
     client.remove_object.assert_called_once_with("mango-calls", "c/a.mp3")
+    assert (
+        await storage.presigned_download_url("c/a.mp3")
+        == "https://files.example.test/minio/mango-calls/c/a.mp3?X-Amz-Signature=abc"
+    )
+    assert client.presigned_get_object.call_args.args[:2] == ("mango-calls", "c/a.mp3")
     assert await storage.is_available()
     assert not await storage.is_available()
     constructor.assert_called_once()
@@ -325,12 +334,13 @@ def test_quality_prompt_contains_grounded_sales_rubric() -> None:
     assert "установление контакта" in QUALITY_SYSTEM_PROMPT
     assert "проверил ли удобство разговора" in QUALITY_SYSTEM_PROMPT
     assert "выяснены сроки, дедлайны и срочность" in QUALITY_SYSTEM_PROMPT
+    assert "Не округляй автоматически" in QUALITY_SYSTEM_PROMPT
     assert "звонок продающий" in QUALITY_SYSTEM_PROMPT
     assert "неотработанный soft_deferral" in QUALITY_SYSTEM_PROMPT
     assert "не утверждай скрытую причину" in QUALITY_SYSTEM_PROMPT
 
 
-def test_quality_control_rejects_unsupported_critical_risk() -> None:
+def test_quality_control_downgrades_unsupported_critical_risk() -> None:
     payload = {
         "score": 90,
         "risk_level": "critical",
@@ -367,12 +377,15 @@ def test_quality_control_rejects_unsupported_critical_risk() -> None:
         "objections": [],
         "next_step": {"status": "agreed", "quote": "Давайте так"},
     }
-    with pytest.raises(ValueError, match="next step is agreed"):
-        OpenAIQaClient._validate_risk_consistency(QualityResult.model_validate(payload))
+    quality, warnings = OpenAIQaClient._normalize_risk_consistency(QualityResult.model_validate(payload))
+    assert quality.risk_level == "warning"
+    assert "next step is agreed" in warnings[0]
+    assert warnings[0] in quality.limitations
 
     payload["next_step"] = {"status": "absent", "quote": None}
-    with pytest.raises(ValueError, match="requires an unresolved"):
-        OpenAIQaClient._validate_risk_consistency(QualityResult.model_validate(payload))
+    quality, warnings = OpenAIQaClient._normalize_risk_consistency(QualityResult.model_validate(payload))
+    assert quality.risk_level == "warning"
+    assert "requires an unresolved" in warnings[0]
 
     payload["objections"] = [
         {
@@ -385,7 +398,9 @@ def test_quality_control_rejects_unsupported_critical_risk() -> None:
             "resolution": "unresolved",
         }
     ]
-    OpenAIQaClient._validate_risk_consistency(QualityResult.model_validate(payload))
+    quality, warnings = OpenAIQaClient._normalize_risk_consistency(QualityResult.model_validate(payload))
+    assert quality.risk_level == "critical"
+    assert warnings == []
 
 
 @pytest.mark.asyncio

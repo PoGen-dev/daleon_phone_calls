@@ -43,6 +43,10 @@ def test_settings_parse_fields_and_cache() -> None:
     assert value.mango_fields_list == ["one", "two", "three"]
     assert value.telegram_main_chat_ids == ["1", "2"]
     assert value.telegram_failure_chat_ids == ["3", "4"]
+    assert Settings(_env_file=None).retry_backoff_seconds == 4
+    assert Settings(_env_file=None).mango_worker_concurrency == 2
+    assert Settings(_env_file=None).mango_result_poll_interval_seconds == 10
+    assert Settings(_env_file=None).mango_recording_download_interval_seconds == 2
     get_settings.cache_clear()
     assert get_settings() is get_settings()
     get_settings.cache_clear()
@@ -96,17 +100,37 @@ def test_analysis_message_matches_business_template() -> None:
     message = format_analysis_message(call, quality())
     assert "🚨 РИСК СРЫВА СДЕЛКИ" in message
     assert "👤 user2 · incoming · 79990000000" in message
-    assert "07.05.2026 18:00 · 3:44" in message
+    assert "07.05.2026 21:00 · 3:44" in message
     assert "👋75 · 🔍60 · 🔥20 · 🎯80 · 🛡40 · 🏁40" in message
     assert "Сделка: 42" in message
+    assert "Оценка: 60, взвешенная" in message
     assert "Подробнее" not in message
 
 
 def test_noncritical_message_and_missing_call_fields() -> None:
-    message = format_analysis_message({"id": "x", "raw": {}}, quality(risk_level="normal", errors=[]))
+    message = format_analysis_message(
+        {"id": "x", "raw": {}, "audio_bucket": "mango-calls", "audio_object_name": "x/recording.mp3"},
+        quality(risk_level="normal", risk_reason="", errors=[]),
+    )
     assert message.startswith("📞 АНАЛИЗ ЗВОНКА")
-    assert "Критичных ошибок не выявлено" in message
+    assert "Критичных ошибок не выявлено" not in message
+    assert "❌ Ошибки" not in message
     assert "📅 - · -" in message
+    assert "Сделка: не привязана" in message
+    assert "Звонок: mango-calls/x/recording.mp3" in message
+    assert "Почему риск" not in message
+
+
+def test_analysis_message_includes_minio_download_link_and_hides_empty_phrases() -> None:
+    message = format_analysis_message(
+        {"id": "x", "recording_url": "https://example.test/mango", "raw": {}},
+        quality(risk_reason="Риск не выявлен", errors=["Критичных ошибок не выявлено."]),
+        recording_download_url="https://files.example.test/mango-calls/x/a.mp3?signature=1",
+    )
+    assert "🎧 Звонок: https://example.test/mango" in message
+    assert "💾 Запись MinIO: https://files.example.test/mango-calls/x/a.mp3?signature=1" in message
+    assert "Почему риск" not in message
+    assert "❌ Ошибки" not in message
 
 
 def test_dead_letter_format_and_prompt() -> None:

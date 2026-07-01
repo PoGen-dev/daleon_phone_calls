@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +37,8 @@ class MangoClient:
         self.api_key = settings.mango_api_key.get_secret_value()
         self.api_salt = settings.mango_api_salt.get_secret_value()
         self.tz = ZoneInfo(settings.mango_default_timezone)
+        self._recording_download_lock = asyncio.Lock()
+        self._last_recording_download_at = 0.0
         transport = httpx.AsyncHTTPTransport(retries=3)
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, read=90.0),
@@ -60,13 +63,38 @@ class MangoClient:
             raise MangoApiError("MANGO_API_KEY/MANGO_API_SALT are required")
         json_payload, sign = self.sign(payload)
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        response = await self.http.post(
-            url,
-            data={"vpbx_api_key": self.api_key, "sign": sign, "json": json_payload},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            response = await self.http.post(
+                url,
+                data={"vpbx_api_key": self.api_key, "sign": sign, "json": json_payload},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if response.status_code == 429 and attempt < attempts:
+                delay = self._retry_after_seconds(response, fallback=self.settings.retry_backoff_seconds * attempt)
+                logger.warning(
+                    "Mango API rate limited request: endpoint=%s attempt=%s/%s delay=%s",
+                    endpoint,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            response.raise_for_status()
+            return response
         response.raise_for_status()
         return response
+
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response, *, fallback: float) -> float:
+        value = response.headers.get("retry-after")
+        if value:
+            try:
+                return max(float(value), 0.0)
+            except ValueError:
+                return fallback
+        return fallback
 
     async def request(self, endpoint: str, payload: dict[str, Any]) -> Any:
         response = await self._post(endpoint, payload)
@@ -289,6 +317,7 @@ class MangoClient:
 
     async def download_recording(self, *, recording_url: str | None, recording_id: str | None) -> tuple[bytes, str]:
         if recording_url:
+            await self._wait_recording_download_slot()
             response = await self.http.get(recording_url)
             response.raise_for_status()
             filename = self._filename_from_response(response, fallback=f"{recording_id or 'recording'}.mp3")
@@ -297,6 +326,7 @@ class MangoClient:
         if not recording_id:
             raise MangoApiError("No recording_url or recording_id supplied")
         endpoint = self.settings.mango_recording_download_endpoint.format(recording_id=recording_id)
+        await self._wait_recording_download_slot()
         response = await self._post(endpoint, {"recording_id": recording_id, "action": "download"})
         try:
             filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
@@ -304,6 +334,7 @@ class MangoClient:
         except MangoApiError:
             result = self._decode_response(response)
         if isinstance(result, str) and result.startswith("http"):
+            await self._wait_recording_download_slot()
             response = await self.http.get(result)
             response.raise_for_status()
             filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
@@ -311,11 +342,23 @@ class MangoClient:
         if isinstance(result, dict):
             url = result.get("recording_url") or result.get("url") or result.get("download_url")
             if url:
+                await self._wait_recording_download_slot()
                 response = await self.http.get(str(url))
                 response.raise_for_status()
                 filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
                 return self._audio_content(response), filename
         raise MangoApiError(f"Cannot resolve Mango recording download URL for {recording_id}: {result!r}")
+
+    async def _wait_recording_download_slot(self) -> None:
+        interval = self.settings.mango_recording_download_interval_seconds
+        if interval <= 0:
+            return
+        async with self._recording_download_lock:
+            now = time.monotonic()
+            wait_for = self._last_recording_download_at + interval - now
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            self._last_recording_download_at = time.monotonic()
 
     @staticmethod
     def _audio_content(response: httpx.Response) -> bytes:

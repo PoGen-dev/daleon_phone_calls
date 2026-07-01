@@ -310,14 +310,17 @@ class OpenAIQaClient:
         quality = QualityResult.model_validate(json.loads(content))
         raw = completion.model_dump(mode="json") if hasattr(completion, "model_dump") else {"content": content}
         self._validate_quality_evidence(quality, transcript)
-        self._validate_risk_consistency(quality)
         model_score = quality.score
         model_criteria = quality.criteria.model_dump(mode="json")
+        model_risk_level = quality.risk_level
+        quality, risk_warnings = self._normalize_risk_consistency(quality)
         quality = self._normalize_criteria_scores(quality)
         quality = quality.model_copy(update={"score": self._compute_quality_score(quality)})
         raw["quality_control"] = {
             "model_score": model_score,
             "model_criteria": model_criteria,
+            "model_risk_level": model_risk_level,
+            "risk_warnings": risk_warnings,
             "computed_score": quality.score,
             "evidence_validated": True,
         }
@@ -347,17 +350,38 @@ class OpenAIQaClient:
                 raise ValueError(f"Analysis contains unsupported quote in {field}: {quote!r}")
 
     @staticmethod
-    def _validate_risk_consistency(quality: QualityResult) -> None:
+    def _critical_risk_consistency_issue(quality: QualityResult) -> str | None:
         if quality.risk_level != "critical":
-            return
+            return None
         if quality.next_step and quality.next_step.status == "agreed":
-            raise ValueError("Critical risk cannot be set when next step is agreed")
+            return "critical risk cannot be set when next step is agreed"
         has_unresolved_risk = any(
             objection.kind in {"explicit", "soft_deferral"} and objection.resolution == "unresolved"
             for objection in quality.objections
         )
         if not has_unresolved_risk:
-            raise ValueError("Critical risk requires an unresolved explicit objection or soft deferral")
+            return "critical risk requires an unresolved explicit objection or soft deferral"
+        return None
+
+    @classmethod
+    def _normalize_risk_consistency(cls, quality: QualityResult) -> tuple[QualityResult, list[str]]:
+        issue = cls._critical_risk_consistency_issue(quality)
+        if issue is None:
+            return quality, []
+
+        warning = f"Model critical risk downgraded to warning: {issue}"
+        original_reason = quality.risk_reason.strip() or "не указана"
+        risk_reason = (
+            "Риск понижен до warning программной проверкой: нет достаточных фактов для critical. "
+            f"Причина модели: {original_reason}"
+        )
+        return quality.model_copy(
+            update={
+                "risk_level": "warning",
+                "risk_reason": risk_reason,
+                "limitations": [*quality.limitations, warning],
+            }
+        ), [warning]
 
     @staticmethod
     def _normalize_criteria_scores(quality: QualityResult) -> QualityResult:

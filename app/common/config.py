@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = "kafka:9092"
     kafka_group_prefix: str = "mango-calls-local"
     retry_max_attempts: int = Field(default=3, ge=1)
-    retry_backoff_seconds: float = Field(default=2.0, ge=0)
+    retry_backoff_seconds: float = Field(default=4.0, ge=0)
     outbox_batch_size: int = Field(default=100, ge=1)
 
     minio_endpoint: str = "minio:9000"
@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     minio_secret_key: SecretStr = Field(default=SecretStr("minioadmin"))
     minio_bucket: str = "mango-calls"
     minio_secure: bool = False
+    minio_public_base_url: str | None = None
+    minio_presigned_url_expires_seconds: int = Field(default=604800, ge=1, le=604800)
 
     openrouter_api_key: SecretStr = Field(default=SecretStr(""))
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -47,8 +49,9 @@ class Settings(BaseSettings):
     mango_lookback_seconds: int = 300
     mango_request_window_seconds: int = 300
     mango_result_poll_attempts: int = 60
-    mango_result_poll_interval_seconds: int = 5
-    mango_worker_concurrency: int = Field(default=4, ge=1)
+    mango_result_poll_interval_seconds: int = 10
+    mango_worker_concurrency: int = Field(default=2, ge=1)
+    mango_recording_download_interval_seconds: float = Field(default=2.0, ge=0)
     mango_test_latest_call_only: bool = False
     mango_test_lookback_seconds: int = Field(default=604800, ge=60)
     mango_stats_fields: Annotated[str, Field(description="Comma-separated Mango stats fields")] = (

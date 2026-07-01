@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Any
 
+from app.clients.minio import MinioStorage
 from app.clients.telegram import TelegramClient
 from app.common.config import Settings, get_settings
 from app.common.db import postgres_pool
@@ -18,7 +19,12 @@ logger = logging.getLogger(__name__)
 
 
 async def process_notification(
-    payload: dict[str, Any], *, repo: Repository, telegram: TelegramClient, settings: Settings
+    payload: dict[str, Any],
+    *,
+    repo: Repository,
+    telegram: TelegramClient,
+    settings: Settings,
+    storage: MinioStorage | None = None,
 ) -> None:
     event_id = payload.get("event_id")
     call_id = payload.get("call_id")
@@ -30,7 +36,16 @@ async def process_notification(
     quality = QualityResult.model_validate(call)
     if not telegram.main_chat_ids:
         raise RuntimeError("TELEGRAM_CHAT_IDS is empty")
-    message = format_analysis_message(call, quality)
+    recording_download_url = None
+    audio_object_name = call.get("audio_object_name")
+    if storage and audio_object_name:
+        recording_download_url = await storage.presigned_download_url(str(audio_object_name))
+    message = format_analysis_message(
+        call,
+        quality,
+        timezone_name=settings.mango_default_timezone,
+        recording_download_url=recording_download_url,
+    )
     for chat_id in telegram.main_chat_ids:
         if await repo.notification_exists(event_id, chat_id, call_id, "main"):
             continue
@@ -82,6 +97,7 @@ async def run() -> None:
     ):
         repo = Repository(pg)
         telegram = TelegramClient(settings)
+        storage = MinioStorage(settings)
         try:
             async for record in consumer:
                 payload = record.value if isinstance(record.value, dict) else {"invalid_payload": record.value}
@@ -91,7 +107,13 @@ async def run() -> None:
                             payload, repo=repo, telegram=telegram, settings=settings
                         )
                     else:
-                        await process_notification(payload, repo=repo, telegram=telegram, settings=settings)
+                        await process_notification(
+                            payload,
+                            repo=repo,
+                            telegram=telegram,
+                            settings=settings,
+                            storage=storage,
+                        )
                 except Exception as exc:
                     logger.exception("Telegram task failed", extra={"topic": record.topic})
                     if record.topic != settings.topic_dead_letter:

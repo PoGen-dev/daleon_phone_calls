@@ -18,4 +18,5 @@ def settings() -> Settings:
         telegram_error_bot_token=SecretStr("error-token"),
         telegram_error_chat_ids="error-chat,error-chat-2",
         retry_backoff_seconds=0,
+        mango_recording_download_interval_seconds=0,
     )
