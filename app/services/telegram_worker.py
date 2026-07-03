@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
+from pathlib import PurePath
 from typing import Any
 
 from app.clients.minio import MinioStorage
@@ -36,20 +38,37 @@ async def process_notification(
     quality = QualityResult.model_validate(call)
     if not telegram.main_chat_ids:
         raise RuntimeError("TELEGRAM_CHAT_IDS is empty")
+    pending_chat_ids = []
+    for chat_id in telegram.main_chat_ids:
+        if not await repo.notification_exists(event_id, chat_id, call_id, "main"):
+            pending_chat_ids.append(chat_id)
+
     recording_download_url = None
+    audio = None
+    audio_filename = None
+    audio_content_type = "application/octet-stream"
     audio_object_name = call.get("audio_object_name")
-    if storage and audio_object_name:
+    if storage and audio_object_name and pending_chat_ids:
         recording_download_url = await storage.presigned_download_url(str(audio_object_name))
+        audio = await storage.download(str(audio_object_name))
+        audio_filename = str(call.get("audio_filename") or PurePath(str(audio_object_name)).name or "recording.mp3")
+        audio_content_type = mimetypes.guess_type(audio_filename)[0] or "application/octet-stream"
     message = format_analysis_message(
         call,
         quality,
         timezone_name=settings.mango_default_timezone,
         recording_download_url=recording_download_url,
     )
-    for chat_id in telegram.main_chat_ids:
-        if await repo.notification_exists(event_id, chat_id, call_id, "main"):
-            continue
+    for chat_id in pending_chat_ids:
         await telegram.send(message, chat_id=chat_id)
+        if audio is not None and audio_filename:
+            await telegram.send_audio_file(
+                audio,
+                filename=audio_filename,
+                chat_id=chat_id,
+                caption=f"Запись звонка {call_id}",
+                content_type=audio_content_type,
+            )
         await repo.save_notification(event_id, chat_id, call_id, "main")
     await repo.mark_call_status(call_id, "notified")
     logger.info("Telegram notification sent", extra={"call_id": call_id})

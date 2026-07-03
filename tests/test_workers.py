@@ -257,11 +257,13 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
     )
     telegram = SimpleNamespace(
         send=AsyncMock(),
+        send_audio_file=AsyncMock(),
         main_chat_ids=["main-1", "main-2"],
         error_chat_ids=["error-1", "error-2"],
     )
     storage = SimpleNamespace(
-        presigned_download_url=AsyncMock(return_value="https://files.example.test/c1/call.mp3?sig=1")
+        presigned_download_url=AsyncMock(return_value="https://files.example.test/c1/call.mp3?sig=1"),
+        download=AsyncMock(return_value=b"audio"),
     )
     payload = {"event_id": "e1", "call_id": "c1"}
     await telegram_worker.process_notification(
@@ -270,13 +272,23 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
     assert "РИСК СРЫВА" in telegram.send.await_args.args[0]
     assert "Запись MinIO: https://files.example.test/c1/call.mp3?sig=1" in telegram.send.await_args.args[0]
     assert telegram.send.await_count == 2
+    assert telegram.send_audio_file.await_count == 2
+    telegram.send_audio_file.assert_any_await(
+        b"audio",
+        filename="call.mp3",
+        chat_id="main-1",
+        caption="Запись звонка c1",
+        content_type="audio/mpeg",
+    )
     storage.presigned_download_url.assert_awaited_once_with("c1/call.mp3")
+    storage.download.assert_awaited_once_with("c1/call.mp3")
     repo.save_notification.assert_awaited_with("e1", "main-2", "c1", "main")
     repo.mark_call_status.assert_awaited_with("c1", "notified")
     await telegram_worker.process_notification(
         payload, repo=repo, telegram=telegram, settings=settings, storage=storage
     )
     assert telegram.send.await_count == 2
+    assert telegram.send_audio_file.await_count == 2
 
     dlq = {"event_id": "e2", "payload": {"call_id": "c1"}, "attempts": 3, "error": "bad"}
     await telegram_worker.process_dead_letter(dlq, repo=repo, telegram=telegram)
