@@ -186,14 +186,19 @@ class OpenAIQaClient:
         headers = {"X-Title": settings.openrouter_app_name}
         if settings.openrouter_http_referer:
             headers["HTTP-Referer"] = settings.openrouter_http_referer
+        
+        proxy = settings.openrouter_proxy_url
+
         self.client = AsyncOpenAI(
             api_key=api_key or None,
             base_url=settings.openrouter_base_url,
             default_headers=headers,
+            http_client=httpx.AsyncClient(proxy=proxy) if proxy else None,
         )
         self.stt_http = httpx.AsyncClient(
             headers={**headers, "Authorization": f"Bearer {api_key}"},
             timeout=httpx.Timeout(30.0, read=600.0),
+            proxy=proxy,
         )
         self.transcription_url = f"{settings.openrouter_base_url.rstrip('/')}/audio/transcriptions"
         self.transcribe_model = settings.openai_transcribe_model

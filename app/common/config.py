@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8080
 
+    openrouter_proxy_url: str | None = None
+    telegram_proxy_url: str | None = None
+
     @property
     def mango_fields_list(self) -> list[str]:
         return [item.strip() for item in self.mango_stats_fields.split(",") if item.strip()]
