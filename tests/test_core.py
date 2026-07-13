@@ -47,6 +47,11 @@ def test_settings_parse_fields_and_cache() -> None:
     assert Settings(_env_file=None).mango_worker_concurrency == 2
     assert Settings(_env_file=None).mango_result_poll_interval_seconds == 10
     assert Settings(_env_file=None).mango_recording_download_interval_seconds == 2
+    assert Settings(_env_file=None).openrouter_transcribe_connect_timeout_seconds == 30
+    assert Settings(_env_file=None).openrouter_transcribe_write_timeout_seconds == 120
+    assert Settings(_env_file=None).openrouter_transcribe_read_timeout_seconds == 900
+    assert Settings(_env_file=None).openrouter_transcribe_pool_timeout_seconds == 30
+
     get_settings.cache_clear()
     assert get_settings() is get_settings()
     get_settings.cache_clear()

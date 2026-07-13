@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     openrouter_app_name: str = "Mango Transcribe Analysis"
     openai_transcribe_model: str = "openai/gpt-4o-transcribe"
     openai_transcribe_language: str | None = "ru"
+    openrouter_transcribe_connect_timeout_seconds: float = Field(default=30.0, ge=0.1)
+    openrouter_transcribe_write_timeout_seconds: float = Field(default=120.0, ge=0.1)
+    openrouter_transcribe_read_timeout_seconds: float = Field(default=900.0, ge=1.0)
+    openrouter_transcribe_pool_timeout_seconds: float = Field(default=30.0, ge=0.1)
+
     openai_transcript_role_model: str | None = "openai/gpt-4o-mini"
     openai_quality_model: str = "openai/gpt-4o-mini"
     openai_quality_temperature: float = 0.0

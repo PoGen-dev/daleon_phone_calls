@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import logging
 import unicodedata
 from pathlib import PurePath
 from typing import Any
@@ -14,6 +15,8 @@ from app.common.config import Settings
 from app.common.models import QualityResult
 from app.prompts.quality import QUALITY_SYSTEM_PROMPT, build_quality_user_prompt
 from app.prompts.transcription import TRANSCRIPT_ROLE_SYSTEM_PROMPT, build_transcript_role_prompt
+
+logger = logging.getLogger(__name__)
 
 CRITERIA_NAMES = ("greeting", "needs_discovery", "urgency", "target_action", "objection_handling", "closing")
 CRITERIA_PROPERTIES = {
@@ -195,11 +198,25 @@ class OpenAIQaClient:
             default_headers=headers,
             http_client=httpx.AsyncClient(proxy=proxy) if proxy else None,
         )
+        self.transcribe_timeout = httpx.Timeout(
+            connect=settings.openrouter_transcribe_connect_timeout_seconds,
+            write=settings.openrouter_transcribe_write_timeout_seconds,
+            read=settings.openrouter_transcribe_read_timeout_seconds,
+            pool=settings.openrouter_transcribe_pool_timeout_seconds,
+        )
+
         self.stt_http = httpx.AsyncClient(
             headers={**headers, "Authorization": f"Bearer {api_key}"},
-            timeout=httpx.Timeout(30.0, read=600.0),
+            timeout=self.transcribe_timeout,
             proxy=proxy,
         )
+        self.transcribe_timeout_log = {
+            "connect": settings.openrouter_transcribe_connect_timeout_seconds,
+            "write": settings.openrouter_transcribe_write_timeout_seconds,
+            "read": settings.openrouter_transcribe_read_timeout_seconds,
+            "pool": settings.openrouter_transcribe_pool_timeout_seconds,
+        }
+
         self.transcription_url = f"{settings.openrouter_base_url.rstrip('/')}/audio/transcriptions"
         self.transcribe_model = settings.openai_transcribe_model
         self.transcribe_language = settings.openai_transcribe_language
@@ -212,17 +229,46 @@ class OpenAIQaClient:
         await self.stt_http.aclose()
 
     async def transcribe(self, *, audio: bytes, filename: str) -> tuple[str, dict[str, Any]]:
+        audio_format = self._audio_format(filename, audio)
+        logger.info(
+            "OpenRouter transcription request started: model=%s filename=%s audio_format=%s "
+            "audio_size_mb=%.2f connect_timeout=%s write_timeout=%s read_timeout=%s pool_timeout=%s",
+            self.transcribe_model,
+            filename,
+            audio_format,
+            len(audio) / 1024 / 1024,
+            self.transcribe_timeout_log["connect"],
+            self.transcribe_timeout_log["write"],
+            self.transcribe_timeout_log["read"],
+            self.transcribe_timeout_log["pool"],
+        )
+
         payload: dict[str, Any] = {
             "model": self.transcribe_model,
             "input_audio": {
                 "data": base64.b64encode(audio).decode("ascii"),
-                "format": self._audio_format(filename, audio),
+                "format": audio_format,
             },
         }
         if self.transcribe_language:
             payload["language"] = self.transcribe_language
         response = await self.stt_http.post(self.transcription_url, json=payload)
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None and status_code >= 400:
+            logger.error(
+                "OpenRouter transcription request failed: status=%s body=%s",
+                status_code,
+                getattr(response, "text", "")[:1000],
+            )
+
         response.raise_for_status()
+        logger.info(
+            "OpenRouter transcription request completed: model=%s filename=%s status=%s",
+            self.transcribe_model,
+            filename,
+            status_code,
+        )
+
         raw = response.json()
         if not isinstance(raw, dict):
             raise ValueError(f"OpenRouter transcription returned {type(raw).__name__}, expected object")

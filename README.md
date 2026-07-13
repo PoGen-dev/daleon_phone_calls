@@ -20,6 +20,7 @@ cp .env.example .env
 # TELEGRAM_CHAT_IDS и TELEGRAM_ERROR_CHAT_IDS содержат chat_id через запятую
 # MANGO_DEFAULT_TIMEZONE задаёт часовой пояс дат в Telegram, по умолчанию Europe/Moscow
 # MINIO_PUBLIC_BASE_URL должен быть адресом MinIO, открываемым из Telegram
+# OPENROUTER_TRANSCRIBE_READ_TIMEOUT_SECONDS задаёт ожидание ответа STT, по умолчанию 900 секунд
 docker compose up --build -d
 docker compose ps
 ```
@@ -43,6 +44,16 @@ docker compose ps
 
 Топики с тремя partition создаёт одноразовый сервис `kafka-init`. Consumer offsets фиксируются только после успешной
 обработки, повторной публикации или переноса в DLQ.
+
+## OpenRouter transcription timeout
+
+Перед отправкой аудио `transcriber-worker` пишет в лог модель, имя файла, формат, размер удио и текущие timeout-настройки.
+Для длинных записей или медленного proxy увеличивайте:
+
+- `OPENROUTER_TRANSCRIBE_CONNECT_TIMEOUT_SECONDS=30` — ожидание подключения.
+- `OPENROUTER_TRANSCRIBE_WRITE_TIMEOUT_SECONDS=120` — ожидание отправки JSON/Base64 аудио.
+- `OPENROUTER_TRANSCRIBE_READ_TIMEOUT_SECONDS=900` — ожидание ответа STT.
+- `OPENROUTER_TRANSCRIBE_POOL_TIMEOUT_SECONDS=30` — ожидание свободного соединения в HTTP ool.
 
 ## Mango rate limit
 

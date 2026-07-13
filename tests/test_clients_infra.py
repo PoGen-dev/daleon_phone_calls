@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -85,7 +86,7 @@ async def test_telegram_sends_to_both_channels_and_validates_response(settings) 
 
 
 @pytest.mark.asyncio
-async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch) -> None:
+async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch, caplog) -> None:
     quality = {
         "score": 80,
         "risk_level": "warning",
@@ -134,17 +135,25 @@ async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch) -
     )
     stt_http = SimpleNamespace(post=AsyncMock(return_value=stt_response), aclose=AsyncMock())
     constructor = MagicMock(return_value=fake)
+    http_client_constructor = MagicMock(return_value=stt_http)
     monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", constructor)
-    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
+    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", http_client_constructor)
     settings.openrouter_http_referer = "https://app.example"
+    settings.openrouter_transcribe_read_timeout_seconds = 123
     ai = OpenAIQaClient(settings)
-    text, raw = await ai.transcribe(audio=b"audio", filename="call.mp3")
+    with caplog.at_level(logging.INFO, logger="app.clients.openai_qa"):
+        text, raw = await ai.transcribe(audio=b"audio", filename="call.mp3")
     result, response = await ai.score_quality(transcript="текст")
     assert text == "привет" and raw["text"] == "привет"
     assert result.score == 0 and response["quality_control"]["model_score"] == 80
     kwargs = constructor.call_args.kwargs
     assert kwargs["base_url"] == settings.openrouter_base_url
     assert kwargs["default_headers"]["HTTP-Referer"] == "https://app.example"
+    timeout = http_client_constructor.call_args.kwargs["timeout"]
+    assert timeout.read == 123
+    assert "OpenRouter transcription request started" in caplog.text
+    assert "audio_size_mb=" in caplog.text
+
     stt_payload = stt_http.post.await_args.kwargs["json"]
     assert stt_payload == {
         "model": "openai/gpt-4o-transcribe",
