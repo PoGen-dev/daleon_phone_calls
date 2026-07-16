@@ -34,13 +34,13 @@ docker compose ps
 
 ## Pipeline и топики
 
-| Topic | Producer | Consumer | Назначение |
-|---|---|---|---|
-| `mango.calls.raw` | mango-worker | аудит/внешние системы | Событие обнаружения звонка |
-| `calls.to_transcribe` | mango-worker | transcriber-worker | Транскрибация объекта MinIO |
-| `calls.to_analyze` | transcriber-worker | quality-worker | Анализ текста из PostgreSQL |
-| `calls.to_notify` | quality-worker | telegram-worker | Уведомление основным ботом |
-| `calls.dead_letter` | все воркеры | telegram-worker | Ошибка после трёх попыток |
+| Topic                 | Producer           | Consumer              | Назначение                  |
+| --------------------- | ------------------ | --------------------- | --------------------------- |
+| `mango.calls.raw`     | mango-worker       | аудит/внешние системы | Событие обнаружения звонка  |
+| `calls.to_transcribe` | mango-worker       | transcriber-worker    | Транскрибация объекта MinIO |
+| `calls.to_analyze`    | transcriber-worker | quality-worker        | Анализ текста из PostgreSQL |
+| `calls.to_notify`     | quality-worker     | telegram-worker       | Уведомление основным ботом  |
+| `calls.dead_letter`   | все воркеры        | telegram-worker       | Ошибка после трёх попыток   |
 
 Топики с тремя partition создаёт одноразовый сервис `kafka-init`. Consumer offsets фиксируются только после успешной
 обработки, повторной публикации или переноса в DLQ.
@@ -141,3 +141,101 @@ docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations
 
 Перед production-запуском замените стандартные пароли MinIO/PostgreSQL, включите TLS/SASL, храните секреты вне `.env`
 и перенесите SQL-схему в миграции. Для строгой атомарности PostgreSQL/Kafka рекомендуется transactional outbox.
+
+
+## VPN/proxy container
+
+Проект поддерживает локальный proxy-сервис `mihomo` внутри Docker Compose. Он нужен, чтобы направить OpenRouter и Telegram через VPN/proxy, не меняя код воркеров.
+
+1. Создайте runtime-конфиг, который не коммитится в Git:
+
+```bash
+mkdir -p infra/mihomo
+cp infra/mihomo/config.example.yaml infra/mihomo/config.yaml
+# перенесите proxies/proxy-groups из вашего Clash/Mihomo YAML в infra/mihomo/config.yaml
+```
+
+Для доступа из других контейнеров в конфиге должны быть значения:
+
+```yaml
+port: 7890
+socks-port: 7891
+allow-lan: true
+bind-address: '*'
+external-controller: '0.0.0.0:9090'
+```
+
+2. В `.env` включите профиль и направьте внешние API через контейнер:
+
+```env
+COMPOSE_PROFILES=vpn
+OPENROUTER_PROXY_URL=http://mihomo:7890
+TELEGRAM_PROXY_URL=http://mihomo:7890
+NO_PROXY=localhost,127.0.0.1,postgres,kafka,zookeeper,minio,api,mihomo
+```
+
+3. Пересоздайте сервисы, которые ходят во внешние API:
+
+```bash
+docker compose up -d --build --force-recreate mihomo transcriber-worker quality-worker telegram-worker
+```
+
+Проверка логов proxy:
+
+```bash
+docker compose logs -f --tail=100 mihomo
+```
+
+
+## Как пересобрать весь проект Windows 
+
+```bash
+docker compose down -v --remove-orphans
+```
+
+```bash
+docker compose rm -f
+```
+
+```bash
+docker image prune -f
+```
+
+```bash
+docker compose build --no-cache
+```
+
+```bash
+docker compose pull
+```
+
+```bash
+docker compose up -d
+```
+
+
+## Как пересобрать весь проект Linux 
+
+```bash
+sudo docker compose down -v --remove-orphans
+```
+
+```bash
+sudo docker compose rm -f
+```
+
+```bash
+sudo docker image prune -f
+```
+
+```bash
+sudo docker compose build --no-cache
+```
+
+```bash
+sudo docker compose pull
+```
+
+```bash
+sudo docker compose up -d
+```

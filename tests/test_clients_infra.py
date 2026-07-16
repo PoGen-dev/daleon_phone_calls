@@ -26,7 +26,11 @@ class Dumpable:
 @pytest.mark.asyncio
 async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -> None:
     settings.minio_public_base_url = "https://files.example.test/minio"
-    response = SimpleNamespace(read=MagicMock(return_value=b"audio"), close=MagicMock(), release_conn=MagicMock())
+    response = SimpleNamespace(
+        read=MagicMock(return_value=b"audio"),
+        close=MagicMock(),
+        release_conn=MagicMock(),
+    )
     client = SimpleNamespace(
         bucket_exists=MagicMock(side_effect=[False, True, RuntimeError("down")]),
         make_bucket=MagicMock(),
@@ -59,23 +63,41 @@ async def test_minio_storage_upload_download_and_health(settings, monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_telegram_sends_to_both_channels_and_validates_response(settings) -> None:
+async def test_telegram_sends_to_both_channels_and_validates_response(
+    settings, monkeypatch
+) -> None:
+    http_client = MagicMock(wraps=__import__("httpx").AsyncClient)
+    monkeypatch.setattr("app.clients.telegram.httpx.AsyncClient", http_client)
+    settings.telegram_proxy_url = "http://mihomo:7890"
     telegram = TelegramClient(settings)
     await telegram.http.aclose()
+    assert http_client.call_args.kwargs["proxy"] == "http://mihomo:7890"
     ok = SimpleNamespace(raise_for_status=MagicMock(), json=lambda: {"ok": True})
-    rejected = SimpleNamespace(raise_for_status=MagicMock(), json=lambda: {"ok": False, "description": "bad"})
-    telegram.http = SimpleNamespace(post=AsyncMock(side_effect=[ok, ok, ok, rejected]), aclose=AsyncMock())
+    rejected = SimpleNamespace(
+        raise_for_status=MagicMock(), json=lambda: {"ok": False, "description": "bad"}
+    )
+    telegram.http = SimpleNamespace(
+        post=AsyncMock(side_effect=[ok, ok, ok, rejected]), aclose=AsyncMock()
+    )
     assert telegram.main_chat_ids == ["main-chat", "main-chat-2"]
     assert telegram.error_chat_ids == ["error-chat", "error-chat-2"]
     await telegram.send("main", chat_id="main-chat")
     await telegram.send("error", chat_id="error-chat", error_channel=True)
-    await telegram.send_audio_file(b"audio", filename="call.mp3", chat_id="main-chat", caption="Запись")
+    await telegram.send_audio_file(
+        b"audio", filename="call.mp3", chat_id="main-chat", caption="Запись"
+    )
     assert "/botmain-token/sendMessage" in telegram.http.post.await_args_list[0].args[0]
-    assert telegram.http.post.await_args_list[1].kwargs["json"]["chat_id"] == "error-chat"
+    assert (
+        telegram.http.post.await_args_list[1].kwargs["json"]["chat_id"] == "error-chat"
+    )
     audio_request = telegram.http.post.await_args_list[2]
     assert "/botmain-token/sendDocument" in audio_request.args[0]
     assert audio_request.kwargs["data"] == {"chat_id": "main-chat", "caption": "Запись"}
-    assert audio_request.kwargs["files"]["document"] == ("call.mp3", b"audio", "application/octet-stream")
+    assert audio_request.kwargs["files"]["document"] == (
+        "call.mp3",
+        b"audio",
+        "application/octet-stream",
+    )
     with pytest.raises(RuntimeError, match="rejected"):
         await telegram.send("bad", chat_id="main-chat")
     telegram.main_token = ""
@@ -85,8 +107,27 @@ async def test_telegram_sends_to_both_channels_and_validates_response(settings) 
     telegram.http.aclose.assert_awaited_once()
 
 
+def test_openrouter_client_uses_configured_proxy(settings, monkeypatch) -> None:
+    sdk_http = SimpleNamespace(aclose=AsyncMock())
+    stt_http = SimpleNamespace(aclose=AsyncMock())
+    http_client = MagicMock(side_effect=[sdk_http, stt_http])
+    openai_constructor = MagicMock(return_value=SimpleNamespace(close=AsyncMock()))
+    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", http_client)
+    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", openai_constructor)
+    settings.openrouter_proxy_url = "http://mihomo:7890"
+
+    ai = OpenAIQaClient(settings)
+
+    assert http_client.call_args_list[0].kwargs["proxy"] == "http://mihomo:7890"
+    assert http_client.call_args_list[1].kwargs["proxy"] == "http://mihomo:7890"
+    assert openai_constructor.call_args.kwargs["http_client"] is sdk_http
+    assert ai.stt_http is stt_http
+
+
 @pytest.mark.asyncio
-async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch, caplog) -> None:
+async def test_openrouter_client_transcribes_and_scores(
+    settings, monkeypatch, caplog
+) -> None:
     quality = {
         "score": 80,
         "risk_level": "warning",
@@ -124,20 +165,30 @@ async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch, c
         "next_step": {"status": "absent", "quote": None},
     }
     completion = Dumpable({"choices": []})
-    completion.choices = [SimpleNamespace(message=SimpleNamespace(content=__import__("json").dumps(quality)))]
+    completion.choices = [
+        SimpleNamespace(
+            message=SimpleNamespace(content=__import__("json").dumps(quality))
+        )
+    ]
     fake = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(return_value=completion))
+        ),
         close=AsyncMock(),
     )
     stt_response = SimpleNamespace(
         raise_for_status=MagicMock(),
         json=lambda: {"text": "привет", "usage": {"seconds": 1}},
     )
-    stt_http = SimpleNamespace(post=AsyncMock(return_value=stt_response), aclose=AsyncMock())
+    stt_http = SimpleNamespace(
+        post=AsyncMock(return_value=stt_response), aclose=AsyncMock()
+    )
     constructor = MagicMock(return_value=fake)
     http_client_constructor = MagicMock(return_value=stt_http)
     monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", constructor)
-    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", http_client_constructor)
+    monkeypatch.setattr(
+        "app.clients.openai_qa.httpx.AsyncClient", http_client_constructor
+    )
     settings.openrouter_http_referer = "https://app.example"
     settings.openrouter_transcribe_read_timeout_seconds = 123
     ai = OpenAIQaClient(settings)
@@ -167,20 +218,32 @@ async def test_openrouter_client_transcribes_and_scores(settings, monkeypatch, c
 
 
 @pytest.mark.asyncio
-async def test_openrouter_transcription_fallback_and_empty_completion(settings, monkeypatch) -> None:
-    completion = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None))])
+async def test_openrouter_transcription_fallback_and_empty_completion(
+    settings, monkeypatch
+) -> None:
+    completion = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
+    )
     fake = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(return_value=completion))
+        ),
         close=AsyncMock(),
     )
     stt_http = SimpleNamespace(
         post=AsyncMock(
-            return_value=SimpleNamespace(raise_for_status=MagicMock(), json=lambda: {"text": "fallback"})
+            return_value=SimpleNamespace(
+                raise_for_status=MagicMock(), json=lambda: {"text": "fallback"}
+            )
         ),
         aclose=AsyncMock(),
     )
-    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
-    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
+    monkeypatch.setattr(
+        "app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake)
+    )
+    monkeypatch.setattr(
+        "app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http)
+    )
     ai = OpenAIQaClient(settings)
     assert (await ai.transcribe(audio=b"x", filename="x.wav"))[0] == "fallback"
     with pytest.raises(Exception):
@@ -212,7 +275,9 @@ def test_openrouter_rejects_unknown_audio_format() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcript_roles_preserve_every_source_word(settings, monkeypatch) -> None:
+async def test_transcript_roles_preserve_every_source_word(
+    settings, monkeypatch
+) -> None:
     content = (
         '{"turns":[{"speaker":"manager","text":"Здравствуйте"},'
         '{"speaker":"client","text":"Мне дорого"}]}'
@@ -220,12 +285,18 @@ async def test_transcript_roles_preserve_every_source_word(settings, monkeypatch
     completion = Dumpable({"choices": []})
     completion.choices = [SimpleNamespace(message=SimpleNamespace(content=content))]
     fake = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(return_value=completion))
+        ),
         close=AsyncMock(),
     )
     stt_http = SimpleNamespace(aclose=AsyncMock())
-    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
-    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
+    monkeypatch.setattr(
+        "app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake)
+    )
+    monkeypatch.setattr(
+        "app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http)
+    )
     ai = OpenAIQaClient(settings)
 
     transcript, raw = await ai.structure_transcript("Здравствуйте. Мне дорого.")
@@ -236,17 +307,25 @@ async def test_transcript_roles_preserve_every_source_word(settings, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_transcript_roles_fall_back_when_model_invents_words(settings, monkeypatch) -> None:
+async def test_transcript_roles_fall_back_when_model_invents_words(
+    settings, monkeypatch
+) -> None:
     content = '{"turns":[{"speaker":"manager","text":"Здравствуйте уважаемый клиент"}]}'
     completion = Dumpable({"choices": []})
     completion.choices = [SimpleNamespace(message=SimpleNamespace(content=content))]
     fake = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=completion))),
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(return_value=completion))
+        ),
         close=AsyncMock(),
     )
     stt_http = SimpleNamespace(aclose=AsyncMock())
-    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
-    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
+    monkeypatch.setattr(
+        "app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake)
+    )
+    monkeypatch.setattr(
+        "app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http)
+    )
     ai = OpenAIQaClient(settings)
 
     transcript, raw = await ai.structure_transcript("Здравствуйте")
@@ -263,8 +342,12 @@ async def test_transcript_roles_can_be_disabled(settings, monkeypatch) -> None:
         close=AsyncMock(),
     )
     stt_http = SimpleNamespace(aclose=AsyncMock())
-    monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake))
-    monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http))
+    monkeypatch.setattr(
+        "app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake)
+    )
+    monkeypatch.setattr(
+        "app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http)
+    )
     settings.openai_transcript_role_model = None
     ai = OpenAIQaClient(settings)
 
@@ -320,7 +403,12 @@ def test_quality_control_rejects_nonexistent_quotes_and_recalculates_score() -> 
                 "category": "price",
                 "manager_response_quote": None,
                 "completed_steps": [],
-                "missing_steps": ["clarified", "answered", "checked_resolution", "agreed_next_step"],
+                "missing_steps": [
+                    "clarified",
+                    "answered",
+                    "checked_resolution",
+                    "agreed_next_step",
+                ],
                 "resolution": "unresolved",
             }
         ],
@@ -336,12 +424,16 @@ def test_quality_control_rejects_nonexistent_quotes_and_recalculates_score() -> 
 
     payload["criteria_evidence"]["greeting"] = []
     with pytest.raises(ValueError, match="has no evidence"):
-        OpenAIQaClient._validate_quality_evidence(QualityResult.model_validate(payload), transcript)
+        OpenAIQaClient._validate_quality_evidence(
+            QualityResult.model_validate(payload), transcript
+        )
 
     payload["criteria_evidence"]["greeting"] = ["Здравствуйте"]
     payload["objections"][0]["customer_quote"] = "Такого клиент не говорил"
     with pytest.raises(ValueError, match="unsupported quote"):
-        OpenAIQaClient._validate_quality_evidence(QualityResult.model_validate(payload), transcript)
+        OpenAIQaClient._validate_quality_evidence(
+            QualityResult.model_validate(payload), transcript
+        )
 
 
 def test_quality_prompt_contains_grounded_sales_rubric() -> None:
@@ -391,13 +483,17 @@ def test_quality_control_downgrades_unsupported_critical_risk() -> None:
         "objections": [],
         "next_step": {"status": "agreed", "quote": "Давайте так"},
     }
-    quality, warnings = OpenAIQaClient._normalize_risk_consistency(QualityResult.model_validate(payload))
+    quality, warnings = OpenAIQaClient._normalize_risk_consistency(
+        QualityResult.model_validate(payload)
+    )
     assert quality.risk_level == "warning"
     assert "next step is agreed" in warnings[0]
     assert warnings[0] in quality.limitations
 
     payload["next_step"] = {"status": "absent", "quote": None}
-    quality, warnings = OpenAIQaClient._normalize_risk_consistency(QualityResult.model_validate(payload))
+    quality, warnings = OpenAIQaClient._normalize_risk_consistency(
+        QualityResult.model_validate(payload)
+    )
     assert quality.risk_level == "warning"
     assert "requires an unresolved" in warnings[0]
 
@@ -408,17 +504,26 @@ def test_quality_control_downgrades_unsupported_critical_risk() -> None:
             "category": "other",
             "manager_response_quote": None,
             "completed_steps": [],
-            "missing_steps": ["clarified", "answered", "checked_resolution", "agreed_next_step"],
+            "missing_steps": [
+                "clarified",
+                "answered",
+                "checked_resolution",
+                "agreed_next_step",
+            ],
             "resolution": "unresolved",
         }
     ]
-    quality, warnings = OpenAIQaClient._normalize_risk_consistency(QualityResult.model_validate(payload))
+    quality, warnings = OpenAIQaClient._normalize_risk_consistency(
+        QualityResult.model_validate(payload)
+    )
     assert quality.risk_level == "critical"
     assert warnings == []
 
 
 @pytest.mark.asyncio
-async def test_retry_republishes_then_moves_to_dead_letter(settings, monkeypatch) -> None:
+async def test_retry_republishes_then_moves_to_dead_letter(
+    settings, monkeypatch
+) -> None:
     publish = AsyncMock()
     monkeypatch.setattr(kafka, "publish_json", publish)
     producer = object()
@@ -457,7 +562,9 @@ async def test_retry_republishes_then_moves_to_dead_letter(settings, monkeypatch
 
 @pytest.mark.asyncio
 async def test_kafka_helpers_and_contexts(settings, monkeypatch) -> None:
-    producer = SimpleNamespace(start=AsyncMock(), stop=AsyncMock(), send_and_wait=AsyncMock())
+    producer = SimpleNamespace(
+        start=AsyncMock(), stop=AsyncMock(), send_and_wait=AsyncMock()
+    )
     producer_class = MagicMock(return_value=producer)
     monkeypatch.setattr(kafka, "AIOKafkaProducer", producer_class)
     async with kafka.kafka_producer(settings) as yielded:
@@ -469,7 +576,9 @@ async def test_kafka_helpers_and_contexts(settings, monkeypatch) -> None:
     consumer = SimpleNamespace(start=AsyncMock(), stop=AsyncMock(), commit=AsyncMock())
     consumer_class = MagicMock(return_value=consumer)
     monkeypatch.setattr(kafka, "AIOKafkaConsumer", consumer_class)
-    async with kafka.kafka_consumer(settings, topic=("one", "two"), group_suffix="test") as yielded:
+    async with kafka.kafka_consumer(
+        settings, topic=("one", "two"), group_suffix="test"
+    ) as yielded:
         assert yielded is consumer
     assert consumer_class.call_args.args == ("one", "two")
     record = SimpleNamespace(topic="one", partition=0, offset=1)
@@ -497,6 +606,9 @@ async def test_postgres_context_closes_pool(settings, monkeypatch) -> None:
 async def test_postgres_connection_decodes_json() -> None:
     conn = SimpleNamespace(set_type_codec=AsyncMock())
     await db._configure_connection(conn)
-    assert [call.args[0] for call in conn.set_type_codec.await_args_list] == ["json", "jsonb"]
+    assert [call.args[0] for call in conn.set_type_codec.await_args_list] == [
+        "json",
+        "jsonb",
+    ]
     decoder = conn.set_type_codec.await_args.kwargs["decoder"]
     assert decoder('{"cursor":"now"}') == {"cursor": "now"}

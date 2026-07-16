@@ -12,7 +12,7 @@ class TelegramClient:
         self.main_chat_ids = settings.telegram_main_chat_ids
         self.error_token = settings.telegram_error_bot_token.get_secret_value()
         self.error_chat_ids = settings.telegram_failure_chat_ids
-        self.http = httpx.AsyncClient(timeout=30, proxy=settings.telegram_proxy_url)
+        self.http = httpx.AsyncClient(timeout=30, proxy=settings.telegram_proxy_url or None)
 
     async def aclose(self) -> None:
         await self.http.aclose()

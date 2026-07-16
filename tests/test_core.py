@@ -7,7 +7,12 @@ from pydantic import ValidationError
 
 from app.common.config import Settings, get_settings
 from app.common.formatting import format_analysis_message, format_dead_letter_message
-from app.common.models import CallRecord, QualityCriteria, QualityResult, TranscriptionRequestedEvent
+from app.common.models import (
+    CallRecord,
+    QualityCriteria,
+    QualityResult,
+    TranscriptionRequestedEvent,
+)
 from app.common.serialization import json_dumps_bytes, json_loads_bytes
 from app.prompts.quality import build_quality_user_prompt
 
@@ -47,6 +52,9 @@ def test_settings_parse_fields_and_cache() -> None:
     assert Settings(_env_file=None).mango_worker_concurrency == 2
     assert Settings(_env_file=None).mango_result_poll_interval_seconds == 10
     assert Settings(_env_file=None).mango_recording_download_interval_seconds == 2
+    assert Settings(_env_file=None).openrouter_proxy_url is None
+    assert Settings(_env_file=None).telegram_proxy_url is None
+
     assert Settings(_env_file=None).openrouter_transcribe_connect_timeout_seconds == 30
     assert Settings(_env_file=None).openrouter_transcribe_write_timeout_seconds == 120
     assert Settings(_env_file=None).openrouter_transcribe_read_timeout_seconds == 900
@@ -66,10 +74,14 @@ def test_default_mango_fields_match_supported_report_columns() -> None:
 def test_models_normalize_naive_datetime_and_validate_attempt() -> None:
     call = CallRecord(id="1", started_at=datetime(2026, 5, 7, 18))
     assert call.started_at and call.started_at.utcoffset().total_seconds() == 0
-    event = TranscriptionRequestedEvent(call_id="1", object_name="1/a.mp3", filename="a.mp3")
+    event = TranscriptionRequestedEvent(
+        call_id="1", object_name="1/a.mp3", filename="a.mp3"
+    )
     assert event.attempt == 1 and event.event_type == "transcription.requested"
     with pytest.raises(ValidationError):
-        TranscriptionRequestedEvent(call_id="1", object_name="a", filename="a", attempt=0)
+        TranscriptionRequestedEvent(
+            call_id="1", object_name="a", filename="a", attempt=0
+        )
 
 
 def test_quality_schema_rejects_invalid_scores() -> None:
@@ -114,7 +126,12 @@ def test_analysis_message_matches_business_template() -> None:
 
 def test_noncritical_message_and_missing_call_fields() -> None:
     message = format_analysis_message(
-        {"id": "x", "raw": {}, "audio_bucket": "mango-calls", "audio_object_name": "x/recording.mp3"},
+        {
+            "id": "x",
+            "raw": {},
+            "audio_bucket": "mango-calls",
+            "audio_object_name": "x/recording.mp3",
+        },
         quality(risk_level="normal", risk_reason="", errors=[]),
     )
     assert message.startswith("📞 АНАЛИЗ ЗВОНКА")
@@ -126,14 +143,21 @@ def test_noncritical_message_and_missing_call_fields() -> None:
     assert "Почему риск" not in message
 
 
-def test_analysis_message_includes_minio_download_link_and_hides_empty_phrases() -> None:
+def test_analysis_message_includes_minio_download_link_and_hides_empty_phrases() -> (
+    None
+):
     message = format_analysis_message(
         {"id": "x", "recording_url": "https://example.test/mango", "raw": {}},
-        quality(risk_reason="Риск не выявлен", errors=["Критичных ошибок не выявлено."]),
+        quality(
+            risk_reason="Риск не выявлен", errors=["Критичных ошибок не выявлено."]
+        ),
         recording_download_url="https://files.example.test/mango-calls/x/a.mp3?signature=1",
     )
     assert "🎧 Звонок: https://example.test/mango" in message
-    assert "💾 Запись MinIO: https://files.example.test/mango-calls/x/a.mp3?signature=1" in message
+    assert (
+        "💾 Запись MinIO: https://files.example.test/mango-calls/x/a.mp3?signature=1"
+        in message
+    )
     assert "Почему риск" not in message
     assert "❌ Ошибки" not in message
 
@@ -148,5 +172,7 @@ def test_dead_letter_format_and_prompt() -> None:
             "error": "timeout",
         }
     )
-    assert "❗ ОШИБКА" in message and "Звонок: c1" in message and "Попыток: 3" in message
+    assert (
+        "❗ ОШИБКА" in message and "Звонок: c1" in message and "Попыток: 3" in message
+    )
     assert "текст звонка" in build_quality_user_prompt("текст звонка")
