@@ -171,7 +171,6 @@ def format_analysis_message(
         f"📅 {started} · {_duration(call)}",
         f"🏢 Автосервис: {_service_name(call)}",
         f"🔗 Сделка: {_deal(call)}",
-        f"🎧 Звонок: {_recording(call)}",
     ]
 
     lines.extend(["", SEPARATOR, ""])

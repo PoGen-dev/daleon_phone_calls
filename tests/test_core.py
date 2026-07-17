@@ -141,19 +141,24 @@ def test_noncritical_message_and_missing_call_fields() -> None:
     assert "❌ Ошибки" not in message
     assert "📅 - · -" in message
     assert "Сделка: не привязана" in message
-    assert "Звонок: mango-calls/x/recording.mp3" in message
+    assert "Звонок:" not in message
     assert "Почему риск" not in message
 
 
 def test_analysis_message_hides_minio_download_link_and_empty_phrases() -> None:
     message = format_analysis_message(
-        {"id": "x", "to_number": "8 (812) 425-30-26", "recording_url": "https://example.test/mango", "raw": {}},
+        {
+            "id": "x",
+            "to_number": "8 (812) 425-30-26",
+            "recording_url": "https://example.test/mango",
+            "raw": {},
+        },
         quality(
             risk_reason="Риск не выявлен", errors=["Критичных ошибок не выявлено."]
         ),
         recording_download_url="https://files.example.test/mango-calls/x/a.mp3?signature=1",
     )
-    assert "🎧 Звонок: https://example.test/mango" in message
+    assert "Звонок:" not in message
     assert "Запись MinIO" not in message
     assert "Автосервис: Volvo" in message
     assert "Почему риск" not in message

@@ -169,7 +169,23 @@ class MangoClient:
             raise MangoApiError(f"Mango stats/result is not ready after polling: {result!r}")
 
         rows = self._parse_stats_result(result, fields)
-        return [self._row_to_call(row) for row in rows]
+        calls: list[CallRecord] = []
+        for index, row in enumerate(rows, start=1):
+            logger.info(
+                "Mango stats raw call row: report_id=%s index=%s row=%s",
+                report_id,
+                index,
+                self._json_dumps(row),
+            )
+            call = self._row_to_call(row)
+            logger.info(
+                "Mango parsed call: report_id=%s index=%s call=%s",
+                report_id,
+                index,
+                self._json_dumps(call.model_dump(mode="json")),
+            )
+            calls.append(call)
+        return calls
 
     @staticmethod
     def _stats_result_payload(initial: Any, key: str) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import re
@@ -64,6 +65,14 @@ async def _store_call(
     storage: MinioStorage,
     settings: Settings,
 ) -> None:
+    call_payload = json.dumps(
+        call.model_dump(mode="json"),
+        ensure_ascii=False,
+        default=str,
+        separators=(",", ":"),
+    )
+    logger.info("Mango call received: call_id=%s call=%s", call.id, call_payload)
+
     await repo.save_call(call)
     if not call.recording_url and not call.recording_id:
         await repo.mark_call_status(call.id, "no_recording", "Mango payload contains no recording reference")
