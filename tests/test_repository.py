@@ -109,7 +109,9 @@ async def test_save_and_read_call() -> None:
 async def test_transcription_operations() -> None:
     conn = Connection()
     repo = Repository(Pool(conn))
-    await repo.save_transcription(call_id="c1", transcript="text", model="m", raw={"x": 1}, duration_seconds=3.5)
+    await repo.save_transcription(
+        call_id="c1", transcript="text", model="m", raw={"x": 1}, duration_seconds=3.5
+    )
     assert conn.execute.await_count == 2
     insert_args = conn.execute.await_args_list[0].args
     assert insert_args[1:4] == ("c1", "text", "m")
@@ -160,8 +162,12 @@ async def test_call_and_outbox_are_saved_in_one_transaction() -> None:
     conn = Connection()
     repo = Repository(Pool(conn))
     messages = [
-        OutboxMessage(topic="raw", key="c1", payload={"call_id": "c1"}, dedupe_key="c1:raw"),
-        OutboxMessage(topic="next", key="c1", payload={"call_id": "c1"}, dedupe_key="c1:next"),
+        OutboxMessage(
+            topic="raw", key="c1", payload={"call_id": "c1"}, dedupe_key="c1:raw"
+        ),
+        OutboxMessage(
+            topic="next", key="c1", payload={"call_id": "c1"}, dedupe_key="c1:next"
+        ),
     ]
     await repo.save_call_and_enqueue(
         CallRecord(id="c1"),
@@ -172,7 +178,12 @@ async def test_call_and_outbox_are_saved_in_one_transaction() -> None:
         messages=messages,
     )
     assert conn.execute.await_count == 3
-    assert conn.execute.await_args_list[1].args[1:] == ("raw", "c1", '{"call_id":"c1"}', "c1:raw")
+    assert conn.execute.await_args_list[1].args[1:] == (
+        "raw",
+        "c1",
+        '{"call_id":"c1"}',
+        "c1:raw",
+    )
 
     await repo.mark_call_failed_and_enqueue("c1", "failed", messages[0])
     assert conn.execute.await_count == 5
@@ -183,8 +194,20 @@ async def test_outbox_read_and_status_updates() -> None:
     conn = Connection()
     repo = Repository(Pool(conn))
     conn.fetch.return_value = [
-        {"id": 1, "topic": "one", "message_key": "c1", "payload": '{"x":1}', "attempts": 0},
-        {"id": 2, "topic": "two", "message_key": None, "payload": {"x": 2}, "attempts": 1},
+        {
+            "id": 1,
+            "topic": "one",
+            "message_key": "c1",
+            "payload": '{"x":1}',
+            "attempts": 0,
+        },
+        {
+            "id": 2,
+            "topic": "two",
+            "message_key": None,
+            "payload": {"x": 2},
+            "attempts": 1,
+        },
     ]
     events = await repo.get_pending_outbox(10)
     assert events[0]["payload"] == {"x": 1}

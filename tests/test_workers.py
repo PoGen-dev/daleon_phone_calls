@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.common.models import CallRecord, QualityResult
-from app.services import mango_worker, quality_worker, telegram_worker, transcriber_worker
+from app.services import (
+    mango_worker,
+    quality_worker,
+    telegram_worker,
+    transcriber_worker,
+)
 
 
 def call(**overrides) -> CallRecord:
@@ -53,15 +58,25 @@ def test_cursor_and_poll_windows(settings) -> None:
         datetime(2026, 1, 1, 11, 55, tzinfo=timezone.utc),
         now,
     )
-    assert mango_worker._poll_window(datetime(2026, 1, 1, 11, tzinfo=timezone.utc), now, settings) == (
+    assert mango_worker._poll_window(
+        datetime(2026, 1, 1, 11, tzinfo=timezone.utc), now, settings
+    ) == (
         datetime(2026, 1, 1, 10, 55, tzinfo=timezone.utc),
         datetime(2026, 1, 1, 11, 5, tzinfo=timezone.utc),
     )
 
 
 def test_latest_recorded_call_selects_newest_eligible_call() -> None:
-    older = call(id="older", recording_id="r1", finished_at=datetime(2026, 5, 7, 18, tzinfo=timezone.utc))
-    newer = call(id="newer", recording_id="r2", finished_at=datetime(2026, 5, 8, 18, tzinfo=timezone.utc))
+    older = call(
+        id="older",
+        recording_id="r1",
+        finished_at=datetime(2026, 5, 7, 18, tzinfo=timezone.utc),
+    )
+    newer = call(
+        id="newer",
+        recording_id="r2",
+        finished_at=datetime(2026, 5, 8, 18, tzinfo=timezone.utc),
+    )
     no_recording = call(
         id="ignored",
         recording_id=None,
@@ -80,10 +95,16 @@ async def test_mango_store_downloads_uploads_and_enqueues(settings) -> None:
         get_call=AsyncMock(return_value=None),
         save_call_and_enqueue=AsyncMock(),
     )
-    mango = SimpleNamespace(download_recording=AsyncMock(return_value=(b"audio", "../call.mp3")))
+    mango = SimpleNamespace(
+        download_recording=AsyncMock(return_value=(b"audio", "../call.mp3"))
+    )
     storage = SimpleNamespace(bucket="bucket", upload=AsyncMock(), remove=AsyncMock())
-    await mango_worker._store_call(call(), repo=repo, mango=mango, storage=storage, settings=settings)
-    storage.upload.assert_awaited_once_with("c1/call.mp3", b"audio", content_type="audio/mpeg")
+    await mango_worker._store_call(
+        call(), repo=repo, mango=mango, storage=storage, settings=settings
+    )
+    storage.upload.assert_awaited_once_with(
+        "c1/call.mp3", b"audio", content_type="audio/mpeg"
+    )
     assert repo.save_call.await_count == 1
     kwargs = repo.save_call_and_enqueue.await_args.kwargs
     assert kwargs["audio_object_name"] == "c1/call.mp3"
@@ -98,13 +119,20 @@ async def test_mango_store_downloads_uploads_and_enqueues(settings) -> None:
 async def test_mango_store_is_idempotent_and_handles_no_recording(settings) -> None:
     repo = SimpleNamespace(
         save_call=AsyncMock(),
-        get_call=AsyncMock(return_value={"audio_object_name": "c1/old.wav", "audio_filename": "old.wav"}),
+        get_call=AsyncMock(
+            return_value={
+                "audio_object_name": "c1/old.wav",
+                "audio_filename": "old.wav",
+            }
+        ),
         mark_call_status=AsyncMock(),
         save_call_and_enqueue=AsyncMock(),
     )
     mango = SimpleNamespace(download_recording=AsyncMock())
     storage = SimpleNamespace(bucket="bucket", upload=AsyncMock(), remove=AsyncMock())
-    await mango_worker._store_call(call(), repo=repo, mango=mango, storage=storage, settings=settings)
+    await mango_worker._store_call(
+        call(), repo=repo, mango=mango, storage=storage, settings=settings
+    )
     mango.download_recording.assert_not_awaited()
     messages = repo.save_call_and_enqueue.await_args.kwargs["messages"]
     assert messages[1].payload["filename"] == "old.wav"
@@ -129,7 +157,9 @@ async def test_mango_ingestion_retries_three_times_then_enqueues_dlq(settings) -
         get_call=AsyncMock(return_value=None),
         mark_call_failed_and_enqueue=AsyncMock(),
     )
-    mango = SimpleNamespace(download_recording=AsyncMock(side_effect=RuntimeError("download failed")))
+    mango = SimpleNamespace(
+        download_recording=AsyncMock(side_effect=RuntimeError("download failed"))
+    )
     storage = SimpleNamespace(bucket="bucket", upload=AsyncMock(), remove=AsyncMock())
     await mango_worker._store_call_with_retries(
         call(), repo=repo, mango=mango, storage=storage, settings=settings
@@ -142,21 +172,29 @@ async def test_mango_ingestion_retries_three_times_then_enqueues_dlq(settings) -
 
 
 @pytest.mark.asyncio
-async def test_mango_removes_new_object_when_database_transaction_fails(settings) -> None:
+async def test_mango_removes_new_object_when_database_transaction_fails(
+    settings,
+) -> None:
     repo = SimpleNamespace(
         save_call=AsyncMock(),
         get_call=AsyncMock(return_value=None),
         save_call_and_enqueue=AsyncMock(side_effect=RuntimeError("database down")),
     )
-    mango = SimpleNamespace(download_recording=AsyncMock(return_value=(b"audio", "call.mp3")))
+    mango = SimpleNamespace(
+        download_recording=AsyncMock(return_value=(b"audio", "call.mp3"))
+    )
     storage = SimpleNamespace(bucket="bucket", upload=AsyncMock(), remove=AsyncMock())
     with pytest.raises(RuntimeError, match="database down"):
-        await mango_worker._store_call(call(), repo=repo, mango=mango, storage=storage, settings=settings)
+        await mango_worker._store_call(
+            call(), repo=repo, mango=mango, storage=storage, settings=settings
+        )
     storage.remove.assert_awaited_once_with("c1/call.mp3")
 
 
 @pytest.mark.asyncio
-async def test_transcriber_processes_audio_and_continues_idempotently(settings, monkeypatch) -> None:
+async def test_transcriber_processes_audio_and_continues_idempotently(
+    settings, monkeypatch
+) -> None:
     repo = SimpleNamespace(
         transcription_exists=AsyncMock(side_effect=[False, True]),
         save_transcription=AsyncMock(),
@@ -195,45 +233,70 @@ async def test_transcriber_processes_audio_and_continues_idempotently(settings, 
         ({"call_id": "c1", "object_name": "x"}, " ", "empty"),
     ],
 )
-async def test_transcriber_validates_payload(settings, monkeypatch, payload, transcript, message) -> None:
-    repo = SimpleNamespace(transcription_exists=AsyncMock(return_value=False), save_transcription=AsyncMock())
+async def test_transcriber_validates_payload(
+    settings, monkeypatch, payload, transcript, message
+) -> None:
+    repo = SimpleNamespace(
+        transcription_exists=AsyncMock(return_value=False),
+        save_transcription=AsyncMock(),
+    )
     storage = SimpleNamespace(download=AsyncMock(return_value=b"audio"))
     ai = SimpleNamespace(transcribe=AsyncMock(return_value=(transcript, {})))
     monkeypatch.setattr(transcriber_worker, "publish_json", AsyncMock())
     with pytest.raises(ValueError, match=message):
         await transcriber_worker.process_task(
-            payload, repo=repo, storage=storage, ai=ai, producer=object(), settings=settings
+            payload,
+            repo=repo,
+            storage=storage,
+            ai=ai,
+            producer=object(),
+            settings=settings,
         )
 
 
 @pytest.mark.asyncio
-async def test_quality_worker_analyzes_and_continues_idempotently(settings, monkeypatch) -> None:
+async def test_quality_worker_analyzes_and_continues_idempotently(
+    settings, monkeypatch
+) -> None:
     repo = SimpleNamespace(
         quality_exists=AsyncMock(side_effect=[False, True]),
         get_transcription=AsyncMock(return_value="transcript"),
         save_quality=AsyncMock(),
     )
-    ai = SimpleNamespace(score_quality=AsyncMock(return_value=(quality(), {"raw": True})))
+    ai = SimpleNamespace(
+        score_quality=AsyncMock(return_value=(quality(), {"raw": True}))
+    )
     publish = AsyncMock()
     monkeypatch.setattr(quality_worker, "publish_json", publish)
-    await quality_worker.process_task({"call_id": "c1"}, repo=repo, ai=ai, producer=object(), settings=settings)
+    await quality_worker.process_task(
+        {"call_id": "c1"}, repo=repo, ai=ai, producer=object(), settings=settings
+    )
     repo.save_quality.assert_awaited_once()
     assert publish.await_args.args[1] == settings.topic_to_notify
-    await quality_worker.process_task({"call_id": "c1"}, repo=repo, ai=ai, producer=object(), settings=settings)
+    await quality_worker.process_task(
+        {"call_id": "c1"}, repo=repo, ai=ai, producer=object(), settings=settings
+    )
     assert ai.score_quality.await_count == 1 and publish.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_quality_worker_validates_input(settings, monkeypatch) -> None:
     repo = SimpleNamespace(
-        quality_exists=AsyncMock(return_value=False), get_transcription=AsyncMock(return_value=None)
+        quality_exists=AsyncMock(return_value=False),
+        get_transcription=AsyncMock(return_value=None),
     )
     monkeypatch.setattr(quality_worker, "publish_json", AsyncMock())
     with pytest.raises(ValueError, match="call_id"):
-        await quality_worker.process_task({}, repo=repo, ai=object(), producer=object(), settings=settings)
+        await quality_worker.process_task(
+            {}, repo=repo, ai=object(), producer=object(), settings=settings
+        )
     with pytest.raises(ValueError, match="No transcription"):
         await quality_worker.process_task(
-            {"call_id": "c1"}, repo=repo, ai=object(), producer=object(), settings=settings
+            {"call_id": "c1"},
+            repo=repo,
+            ai=object(),
+            producer=object(),
+            settings=settings,
         )
 
 
@@ -246,11 +309,14 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
         "finished_at": "2026-05-07T18:03:44+00:00",
         "recording_url": "https://example.test",
         "audio_object_name": "c1/call.mp3",
+        "to_number": "7 (812) 760-80-26",
         "raw": {},
         **result,
     }
     repo = SimpleNamespace(
-        notification_exists=AsyncMock(side_effect=[False, False, True, True, False, False]),
+        notification_exists=AsyncMock(
+            side_effect=[False, False, True, True, False, False]
+        ),
         get_call_with_results=AsyncMock(return_value=call_data),
         save_notification=AsyncMock(),
         mark_call_status=AsyncMock(),
@@ -262,35 +328,45 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
         error_chat_ids=["error-1", "error-2"],
     )
     storage = SimpleNamespace(
-        presigned_download_url=AsyncMock(return_value="https://files.example.test/c1/call.mp3?sig=1"),
+        presigned_download_url=AsyncMock(
+            return_value="https://files.example.test/c1/call.mp3?sig=1"
+        ),
         download=AsyncMock(return_value=b"audio"),
     )
     payload = {"event_id": "e1", "call_id": "c1"}
     await telegram_worker.process_notification(
         payload, repo=repo, telegram=telegram, settings=settings, storage=storage
     )
-    assert "РИСК СРЫВА" in telegram.send.await_args.args[0]
-    assert "Запись MinIO: https://files.example.test/c1/call.mp3?sig=1" in telegram.send.await_args.args[0]
-    assert telegram.send.await_count == 2
+    assert telegram.send.await_count == 0
     assert telegram.send_audio_file.await_count == 2
+    first_audio_call = telegram.send_audio_file.await_args_list[0]
+    assert "РИСК СРЫВА" in first_audio_call.kwargs["caption"]
+    assert "Автосервис: Toyota" in first_audio_call.kwargs["caption"]
+    assert "Запись MinIO" not in first_audio_call.kwargs["caption"]
+
     telegram.send_audio_file.assert_any_await(
         b"audio",
         filename="call.mp3",
         chat_id="main-1",
-        caption="Запись звонка c1",
+        caption=first_audio_call.kwargs["caption"],
         content_type="audio/mpeg",
     )
-    storage.presigned_download_url.assert_awaited_once_with("c1/call.mp3")
+    storage.presigned_download_url.assert_not_awaited()
     storage.download.assert_awaited_once_with("c1/call.mp3")
     repo.save_notification.assert_awaited_with("e1", "main-2", "c1", "main")
     repo.mark_call_status.assert_awaited_with("c1", "notified")
     await telegram_worker.process_notification(
         payload, repo=repo, telegram=telegram, settings=settings, storage=storage
     )
-    assert telegram.send.await_count == 2
+    assert telegram.send.await_count == 0
     assert telegram.send_audio_file.await_count == 2
 
-    dlq = {"event_id": "e2", "payload": {"call_id": "c1"}, "attempts": 3, "error": "bad"}
+    dlq = {
+        "event_id": "e2",
+        "payload": {"call_id": "c1"},
+        "attempts": 3,
+        "error": "bad",
+    }
     await telegram_worker.process_dead_letter(dlq, repo=repo, telegram=telegram)
     assert telegram.send.await_args.kwargs["error_channel"] is True
     assert telegram.send.await_count == 4
@@ -303,12 +379,19 @@ async def test_telegram_worker_validates_payload_and_analysis(settings) -> None:
         notification_exists=AsyncMock(return_value=False),
         get_call_with_results=AsyncMock(return_value=None),
     )
-    telegram = SimpleNamespace(send=AsyncMock(), main_chat_ids=["main"], error_chat_ids=["error"])
+    telegram = SimpleNamespace(
+        send=AsyncMock(), main_chat_ids=["main"], error_chat_ids=["error"]
+    )
     with pytest.raises(ValueError, match="event_id/call_id"):
-        await telegram_worker.process_notification({}, repo=repo, telegram=telegram, settings=settings)
+        await telegram_worker.process_notification(
+            {}, repo=repo, telegram=telegram, settings=settings
+        )
     with pytest.raises(ValueError, match="No analysis"):
         await telegram_worker.process_notification(
-            {"event_id": "e", "call_id": "c"}, repo=repo, telegram=telegram, settings=settings
+            {"event_id": "e", "call_id": "c"},
+            repo=repo,
+            telegram=telegram,
+            settings=settings,
         )
     with pytest.raises(ValueError, match="event_id"):
         await telegram_worker.process_dead_letter({}, repo=repo, telegram=telegram)
@@ -346,8 +429,12 @@ async def test_telegram_worker_retries_only_missing_recipients(settings) -> None
     )
     payload = {"event_id": "e1", "call_id": "c1"}
     with pytest.raises(RuntimeError, match="temporary"):
-        await telegram_worker.process_notification(payload, repo=repo, telegram=telegram, settings=settings)
-    await telegram_worker.process_notification(payload, repo=repo, telegram=telegram, settings=settings)
+        await telegram_worker.process_notification(
+            payload, repo=repo, telegram=telegram, settings=settings
+        )
+    await telegram_worker.process_notification(
+        payload, repo=repo, telegram=telegram, settings=settings
+    )
     assert telegram.send.await_count == 3
     assert telegram.send.await_args.kwargs["chat_id"] == "second"
     repo.mark_call_status.assert_awaited_once_with("c1", "notified")
@@ -360,17 +447,23 @@ async def test_telegram_worker_rejects_empty_recipient_lists(settings) -> None:
     telegram = SimpleNamespace(main_chat_ids=[], error_chat_ids=[], send=AsyncMock())
     with pytest.raises(RuntimeError, match="TELEGRAM_CHAT_IDS"):
         await telegram_worker.process_notification(
-            {"event_id": "e", "call_id": "c1"}, repo=repo, telegram=telegram, settings=settings
+            {"event_id": "e", "call_id": "c1"},
+            repo=repo,
+            telegram=telegram,
+            settings=settings,
         )
     with pytest.raises(RuntimeError, match="TELEGRAM_ERROR_CHAT_IDS"):
-        await telegram_worker.process_dead_letter({"event_id": "e", "payload": {}}, repo=repo, telegram=telegram)
+        await telegram_worker.process_dead_letter(
+            {"event_id": "e", "payload": {}}, repo=repo, telegram=telegram
+        )
 
 
 @pytest.mark.asyncio
 async def test_error_bot_delivery_is_retried_three_times(settings) -> None:
     repo = SimpleNamespace(notification_exists=AsyncMock(return_value=False))
     telegram = SimpleNamespace(
-        send=AsyncMock(side_effect=RuntimeError("telegram down")), error_chat_ids=["error"]
+        send=AsyncMock(side_effect=RuntimeError("telegram down")),
+        error_chat_ids=["error"],
     )
     payload = {"event_id": "e", "payload": {"call_id": "c"}}
     with pytest.raises(RuntimeError, match="telegram down"):

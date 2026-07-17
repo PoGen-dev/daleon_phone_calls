@@ -111,6 +111,7 @@ def test_analysis_message_matches_business_template() -> None:
         "finished_at": "2026-05-07T18:03:44+00:00",
         "direction": "incoming",
         "from_number": "79990000000",
+        "to_number": "+7 (812) 615-85-10",
         "recording_url": "https://example.test/play/1",
         "raw": {"user_name": "user2", "deal_id": "42"},
     }
@@ -119,6 +120,7 @@ def test_analysis_message_matches_business_template() -> None:
     assert "👤 user2 · incoming · 79990000000" in message
     assert "07.05.2026 21:00 · 3:44" in message
     assert "👋75 · 🔍60 · 🔥20 · 🎯80 · 🛡40 · 🏁40" in message
+    assert "Автосервис: Nissan" in message
     assert "Сделка: 42" in message
     assert "Оценка: 60, взвешенная" in message
     assert "Подробнее" not in message
@@ -143,21 +145,17 @@ def test_noncritical_message_and_missing_call_fields() -> None:
     assert "Почему риск" not in message
 
 
-def test_analysis_message_includes_minio_download_link_and_hides_empty_phrases() -> (
-    None
-):
+def test_analysis_message_hides_minio_download_link_and_empty_phrases() -> None:
     message = format_analysis_message(
-        {"id": "x", "recording_url": "https://example.test/mango", "raw": {}},
+        {"id": "x", "to_number": "8 (812) 425-30-26", "recording_url": "https://example.test/mango", "raw": {}},
         quality(
             risk_reason="Риск не выявлен", errors=["Критичных ошибок не выявлено."]
         ),
         recording_download_url="https://files.example.test/mango-calls/x/a.mp3?signature=1",
     )
     assert "🎧 Звонок: https://example.test/mango" in message
-    assert (
-        "💾 Запись MinIO: https://files.example.test/mango-calls/x/a.mp3?signature=1"
-        in message
-    )
+    assert "Запись MinIO" not in message
+    assert "Автосервис: Volvo" in message
     assert "Почему риск" not in message
     assert "❌ Ошибки" not in message
 

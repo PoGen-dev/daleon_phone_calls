@@ -65,6 +65,58 @@ def _recording(call: dict[str, Any]) -> str:
     return "не найдена"
 
 
+SERVICE_BY_PHONE: dict[str, str] = {
+    "78126158510": "Nissan",
+    "78126158826": "Nissan",
+    "78127604872": "Toyota",
+    "78127608026": "Toyota",
+    "79119261320": "Nissan",
+    "79213929052": "Toyota",
+    "78124253009": "VAG",
+    "78124253026": "Volvo",
+    "78124253081": "VAG",
+    "78125653421": "Volvo",
+    "79119221330": "Volvo",
+    "79219994141": "VAG",
+}
+
+
+def _normalize_phone(value: Any) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) == 10 and digits.startswith("9"):
+        return f"7{digits}"
+    if len(digits) == 11 and digits.startswith("8"):
+        return f"7{digits[1:]}"
+    return digits
+
+
+def _called_phone_candidates(call: dict[str, Any]) -> list[Any]:
+    raw = call.get("raw") or {}
+    return [
+        call.get("to_number"),
+        call.get("called_number"),
+        call.get("destination_number"),
+        raw.get("to_number"),
+        raw.get("called_number"),
+        raw.get("destination_number"),
+        raw.get("line_number"),
+    ]
+
+
+def _service_name(call: dict[str, Any]) -> str:
+    for value in _called_phone_candidates(call):
+        digits = _normalize_phone(value)
+        if not digits:
+            continue
+        if digits in SERVICE_BY_PHONE:
+            return SERVICE_BY_PHONE[digits]
+        for phone, service_name in SERVICE_BY_PHONE.items():
+            if digits.endswith(phone) or digits.endswith(phone[-10:]):
+                return service_name
+    return "не определён"
+
+
+
 def _risk_reason(quality: QualityResult) -> str:
     if quality.risk_reason:
         return quality.risk_reason
@@ -117,11 +169,10 @@ def format_analysis_message(
         "",
         f"👤 {_manager(call)} · {call.get('direction') or '-'} · {call.get('from_number') or '-'}",
         f"📅 {started} · {_duration(call)}",
+        f"🏢 Автосервис: {_service_name(call)}",
         f"🔗 Сделка: {_deal(call)}",
         f"🎧 Звонок: {_recording(call)}",
     ]
-    if recording_download_url:
-        lines.append(f"💾 Запись MinIO: {recording_download_url}")
 
     lines.extend(["", SEPARATOR, ""])
     risk_reason = _risk_reason(quality)

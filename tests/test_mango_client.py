@@ -11,7 +11,9 @@ from app.clients.mango import MangoApiError, MangoClient
 
 
 class Response:
-    def __init__(self, *, data=None, text="", content=b"audio", headers=None, status_code=200) -> None:
+    def __init__(
+        self, *, data=None, text="", content=b"audio", headers=None, status_code=200
+    ) -> None:
         self._data = data
         self.text = text
         self.content = content
@@ -34,13 +36,17 @@ def test_signature_and_json_are_stable(settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_handles_json_text_empty_and_missing_credentials(settings) -> None:
+async def test_request_handles_json_text_empty_and_missing_credentials(
+    settings,
+) -> None:
     client = MangoClient(settings)
     await client.http.aclose()
     client.http = SimpleNamespace(
         post=AsyncMock(
             side_effect=[
-                Response(data={"key": "1"}, headers={"content-type": "application/json"}),
+                Response(
+                    data={"key": "1"}, headers={"content-type": "application/json"}
+                ),
                 Response(text='{"value": 2}'),
                 Response(text="plain"),
                 Response(text="", content=b""),
@@ -54,7 +60,10 @@ async def test_request_handles_json_text_empty_and_missing_credentials(settings)
     assert await client.request("stats", {}) is None
     assert await client.request_with_status("stats", {}) == (204, None)
     request = client.http.post.await_args_list[0]
-    assert request.args[0].endswith("/stats") and request.kwargs["data"]["vpbx_api_key"] == "mango-key"
+    assert (
+        request.args[0].endswith("/stats")
+        and request.kwargs["data"]["vpbx_api_key"] == "mango-key"
+    )
 
     client.api_key = ""
     with pytest.raises(MangoApiError, match="required"):
@@ -70,7 +79,9 @@ async def test_request_retries_mango_rate_limit(settings, monkeypatch) -> None:
         post=AsyncMock(
             side_effect=[
                 Response(status_code=429, headers={"retry-after": "3"}),
-                Response(data={"ok": True}, headers={"content-type": "application/json"}),
+                Response(
+                    data={"ok": True}, headers={"content-type": "application/json"}
+                ),
             ]
         )
     )
@@ -92,7 +103,10 @@ async def test_fetch_calls_polls_until_ready(settings, monkeypatch) -> None:
     client.request_with_status = AsyncMock(
         side_effect=[
             (204, None),
-            (200, {"data": [{"call_id": "c1", "records": "r1", "start": "1710000000"}]}),
+            (
+                200,
+                {"data": [{"call_id": "c1", "records": "r1", "start": "1710000000"}]},
+            ),
         ]
     )
     sleep = AsyncMock()
@@ -115,7 +129,9 @@ async def test_fetch_calls_polls_until_ready(settings, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_calls_rejects_missing_key_and_poll_timeout(settings, monkeypatch) -> None:
+async def test_fetch_calls_rejects_missing_key_and_poll_timeout(
+    settings, monkeypatch
+) -> None:
     client = MangoClient(settings)
     client.request = AsyncMock(return_value={})
     with pytest.raises(MangoApiError, match="did not return key"):
@@ -136,7 +152,9 @@ async def test_fetch_calls_treats_empty_200_as_ready_report(settings) -> None:
     client.request = AsyncMock(return_value={"key": "empty-report"})
     client.request_with_status = AsyncMock(return_value=(200, None))
 
-    calls = await client.fetch_calls(datetime.now(timezone.utc), datetime.now(timezone.utc))
+    calls = await client.fetch_calls(
+        datetime.now(timezone.utc), datetime.now(timezone.utc)
+    )
 
     assert calls == []
     client.request_with_status.assert_awaited_once()
@@ -149,8 +167,13 @@ def test_result_parsing_and_readiness(settings) -> None:
     csv = "records;start\n[rec-1];1710000000\n"
     assert client._parse_stats_result(csv, fields)[0]["records"] == "rec-1"
     assert client._parse_stats_result({"data": csv}, fields)[0]["start"] == "1710000000"
-    assert client._parse_stats_result({"result": {"csv": csv}}, fields)[0]["records"] == "rec-1"
-    assert client._parse_stats_result({"rows": [{"records": "r"}]}, fields) == [{"records": "r"}]
+    assert (
+        client._parse_stats_result({"result": {"csv": csv}}, fields)[0]["records"]
+        == "rec-1"
+    )
+    assert client._parse_stats_result({"rows": [{"records": "r"}]}, fields) == [
+        {"records": "r"}
+    ]
     with pytest.raises(MangoApiError, match="Unsupported"):
         client._parse_stats_result(42, fields)
     assert not client._is_result_ready(None)
@@ -161,8 +184,13 @@ def test_result_parsing_and_readiness(settings) -> None:
     assert client._is_result_ready("csv") and client._is_result_ready([])
     assert client._extract_key(SimpleNamespace(key="x")) == "x"
     assert client._extract_key({"result": "not-a-dict"}) is None
-    assert client._stats_result_payload({"key": "k", "expires": 1}, "k") == {"key": "k", "expires": 1}
-    assert client._stats_result_payload({"result": {"key": "k", "expires": 1}}, "k") == {
+    assert client._stats_result_payload({"key": "k", "expires": 1}, "k") == {
+        "key": "k",
+        "expires": 1,
+    }
+    assert client._stats_result_payload(
+        {"result": {"key": "k", "expires": 1}}, "k"
+    ) == {
         "key": "k",
         "expires": 1,
     }
@@ -186,8 +214,14 @@ def test_row_mapping_urls_dates_and_fallback(settings) -> None:
     call = client._row_to_call(row)
     assert call.id == "e1" and call.recording_url.startswith("https://")
     assert call.recording_id is None and call.raw.get("empty") is None
-    assert call.started_at.tzinfo == timezone.utc and call.finished_at.tzinfo == timezone.utc
-    assert client._extract_recording_url({"record_url": "https://direct"}) == "https://direct"
+    assert (
+        call.started_at.tzinfo == timezone.utc
+        and call.finished_at.tzinfo == timezone.utc
+    )
+    assert (
+        client._extract_recording_url({"record_url": "https://direct"})
+        == "https://direct"
+    )
     assert client._extract_recording_url({}) is None
     assert client._extract_recording_id({"record_id": "r"}) == "r"
     assert client._extract_recording_id({}) is None
@@ -195,9 +229,17 @@ def test_row_mapping_urls_dates_and_fallback(settings) -> None:
     assert client._parse_mango_datetime(None) is None
     assert client._parse_mango_datetime("bad date") is None
     fallback = client._row_to_call({"from_number": "1"})
-    assert len(fallback.id) == 32 and fallback.id == client._stable_fallback_id({"from_number": "1"})
-    assert client._row_to_call({"call_id": "out", "from_extension": "101"}).direction == "outgoing"
-    assert client._row_to_call({"call_id": "in", "to_extension": "102"}).direction == "incoming"
+    assert len(fallback.id) == 32 and fallback.id == client._stable_fallback_id(
+        {"from_number": "1"}
+    )
+    assert (
+        client._row_to_call({"call_id": "out", "from_extension": "101"}).direction
+        == "outgoing"
+    )
+    assert (
+        client._row_to_call({"call_id": "in", "to_extension": "102"}).direction
+        == "incoming"
+    )
 
 
 @pytest.mark.asyncio
@@ -215,19 +257,30 @@ async def test_download_recording_all_supported_responses(settings) -> None:
             ]
         )
     )
-    assert await client.download_recording(recording_url="https://a", recording_id=None) == (
+    assert await client.download_recording(
+        recording_url="https://a", recording_id=None
+    ) == (
         b"RIFF0000WAVEone",
         "call.wav",
     )
     client._post = AsyncMock(
         side_effect=[
             Response(content=b"ID3two"),
-            Response(data={"download_url": "https://c"}, headers={"content-type": "application/json"}),
+            Response(
+                data={"download_url": "https://c"},
+                headers={"content-type": "application/json"},
+            ),
             Response(data={}, headers={"content-type": "application/json"}),
         ]
     )
-    assert await client.download_recording(recording_url=None, recording_id="r2") == (b"ID3two", "r2.mp3")
-    assert await client.download_recording(recording_url=None, recording_id="r3") == (b"OggSthree", "r3.mp3")
+    assert await client.download_recording(recording_url=None, recording_id="r2") == (
+        b"ID3two",
+        "r2.mp3",
+    )
+    assert await client.download_recording(recording_url=None, recording_id="r3") == (
+        b"OggSthree",
+        "r3.mp3",
+    )
     endpoint, payload = client._post.await_args_list[0].args
     assert endpoint == "queries/recording/post/"
     assert payload == {"recording_id": "r2", "action": "download"}
@@ -242,7 +295,11 @@ async def test_download_recording_all_supported_responses(settings) -> None:
     [
         (b"", {}, "empty"),
         (b"<html>player</html>", {"content-type": "text/html"}, "non-audio"),
-        (b'{"error":"denied"}', {"content-type": "application/octet-stream"}, "document"),
+        (
+            b'{"error":"denied"}',
+            {"content-type": "application/octet-stream"},
+            "document",
+        ),
         (b"unknown", {}, "unsupported"),
     ],
 )
@@ -252,5 +309,7 @@ def test_recording_content_validation(content, headers, message) -> None:
 
 
 def test_recording_content_accepts_declared_audio() -> None:
-    response = Response(content=b"opaque audio", headers={"content-type": "audio/mpeg; charset=binary"})
+    response = Response(
+        content=b"opaque audio", headers={"content-type": "audio/mpeg; charset=binary"}
+    )
     assert MangoClient._audio_content(response) == b"opaque audio"

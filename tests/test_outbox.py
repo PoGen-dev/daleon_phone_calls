@@ -24,7 +24,10 @@ async def test_outbox_publishes_in_order(settings, monkeypatch) -> None:
     monkeypatch.setattr(outbox, "publish_json", publish)
     assert await outbox.publish_pending_outbox(repo, object(), limit=10) == 2
     assert [item.args[1] for item in publish.await_args_list] == ["raw", "next"]
-    assert [item.args[0] for item in repo.mark_outbox_published.await_args_list] == [1, 2]
+    assert [item.args[0] for item in repo.mark_outbox_published.await_args_list] == [
+        1,
+        2,
+    ]
     repo.mark_outbox_failed.assert_not_awaited()
 
 
@@ -40,7 +43,9 @@ async def test_outbox_stops_after_first_failure(monkeypatch) -> None:
         mark_outbox_published=AsyncMock(),
         mark_outbox_failed=AsyncMock(),
     )
-    monkeypatch.setattr(outbox, "publish_json", AsyncMock(side_effect=RuntimeError("kafka down")))
+    monkeypatch.setattr(
+        outbox, "publish_json", AsyncMock(side_effect=RuntimeError("kafka down"))
+    )
     assert await outbox.publish_pending_outbox(repo, object()) == 0
     repo.mark_outbox_failed.assert_awaited_once_with(1, "kafka down")
     repo.mark_outbox_published.assert_not_awaited()
