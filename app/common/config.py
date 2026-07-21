@@ -71,6 +71,22 @@ class Settings(BaseSettings):
     telegram_error_chat_ids: str = ""
     telegram_api_base_url: str = "https://api.telegram.org"
 
+    telegram_admin_chat_id: str = ""
+    telegram_admin_critical_thread_id: str = ""
+    telegram_admin_closed_deals_thread_id: str = ""
+    telegram_admin_other_thread_id: str = ""
+    telegram_admin_transcripts_thread_id: str = ""
+
+    telegram_toyota_nissan_chat_id: str = ""
+    telegram_toyota_nissan_critical_thread_id: str = ""
+    telegram_toyota_nissan_closed_deals_thread_id: str = ""
+    telegram_toyota_nissan_other_thread_id: str = ""
+
+    telegram_volvo_vag_chat_id: str = ""
+    telegram_volvo_vag_critical_thread_id: str = ""
+    telegram_volvo_vag_closed_deals_thread_id: str = ""
+    telegram_volvo_vag_other_thread_id: str = ""
+ 
     topic_mango_raw: str = "mango.calls.raw"
     topic_to_transcribe: str = "calls.to_transcribe"
     topic_to_analyze: str = "calls.to_analyze"

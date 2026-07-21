@@ -32,7 +32,9 @@ def _duration(call: dict[str, Any]) -> str:
 
 def _date(call: dict[str, Any], *, timezone_name: str) -> str:
     try:
-        value = _parse_datetime(call["started_at"]).astimezone(_display_timezone(timezone_name))
+        value = _parse_datetime(call["started_at"]).astimezone(
+            _display_timezone(timezone_name)
+        )
         return value.strftime("%d.%m.%Y %H:%M")
     except (KeyError, TypeError, ValueError):
         return "-"
@@ -40,7 +42,12 @@ def _date(call: dict[str, Any], *, timezone_name: str) -> str:
 
 def _manager(call: dict[str, Any]) -> str:
     raw = call.get("raw") or {}
-    return str(raw.get("manager_name") or raw.get("user_name") or raw.get("from_extension") or "-")
+    return str(
+        raw.get("manager_name")
+        or raw.get("user_name")
+        or raw.get("from_extension")
+        or "-"
+    )
 
 
 def _deal(call: dict[str, Any]) -> str:
@@ -103,18 +110,56 @@ def _called_phone_candidates(call: dict[str, Any]) -> list[Any]:
     ]
 
 
-def _service_name(call: dict[str, Any]) -> str:
+def _format_phone(value: str) -> str:
+    digits = _normalize_phone(value)
+    if len(digits) == 11 and digits.startswith("7"):
+        return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+    return value
+
+
+def _service_info(call: dict[str, Any]) -> tuple[str, str | None]:
+    fallback_phone: str | None = None
     for value in _called_phone_candidates(call):
         digits = _normalize_phone(value)
         if not digits:
             continue
+        if fallback_phone is None:
+            fallback_phone = digits
+
         if digits in SERVICE_BY_PHONE:
-            return SERVICE_BY_PHONE[digits]
+            return SERVICE_BY_PHONE[digits], digits
         for phone, service_name in SERVICE_BY_PHONE.items():
             if digits.endswith(phone) or digits.endswith(phone[-10:]):
-                return service_name
-    return "не определён"
+                return service_name, phone
+    return "не определён", fallback_phone
 
+
+def _service_name(call: dict[str, Any]) -> str:
+    return _service_info(call)[0]
+
+
+def _service_title(call: dict[str, Any]) -> str:
+    service_name, phone = _service_info(call)
+    if phone:
+        return f"{service_name} ({_format_phone(phone)})"
+    return service_name
+
+
+def call_service_info(call: dict[str, Any]) -> tuple[str, str | None]:
+    return _service_info(call)
+
+
+def call_service_name(call: dict[str, Any]) -> str:
+    return _service_name(call)
+
+
+def call_service_group(call: dict[str, Any]) -> str | None:
+    service_name = _service_name(call).lower()
+    if service_name in {"toyota", "nissan"}:
+        return "toyota_nissan"
+    if service_name in {"volvo", "vag"}:
+        return "volvo_vag"
+    return None
 
 
 def _risk_reason(quality: QualityResult) -> str:
@@ -134,7 +179,12 @@ def _criteria_line(criteria: QualityCriteria) -> str:
 
 def _is_no_risk_reason(value: str) -> bool:
     normalized = " ".join(value.strip().lower().replace(".", "").split())
-    return normalized in {"риск не выявлен", "риска нет", "риск не обнаружен", "не выявлен"}
+    return normalized in {
+        "риск не выявлен",
+        "риска нет",
+        "риск не обнаружен",
+        "не выявлен",
+    }
 
 
 def _visible_errors(errors: list[str]) -> list[str]:
@@ -169,7 +219,7 @@ def format_analysis_message(
         "",
         f"👤 {_manager(call)} · {call.get('direction') or '-'} · {call.get('from_number') or '-'}",
         f"📅 {started} · {_duration(call)}",
-        f"🏢 Автосервис: {_service_name(call)}",
+        f"🏢 Автосервис: {_service_title(call)}",
         f"🔗 Сделка: {_deal(call)}",
     ]
 
@@ -197,6 +247,26 @@ def format_analysis_message(
             quality.recommendation,
         ]
     )
+    return "\n".join(lines)
+
+
+def format_transcript_message(
+    call: dict[str, Any], *, timezone_name: str = "Europe/Moscow"
+) -> str:
+    started = _date(call, timezone_name=timezone_name)
+    transcript = str(call.get("transcript") or "").strip() or "Транскрипт отсутствует."
+    lines = [
+        "📝 ТРАНСКРИБИРОВАННЫЙ ЗВОНОК",
+        "",
+        f"🏢 Автосервис: {_service_title(call)}",
+        f"👤 {_manager(call)} · {call.get('direction') or '-'} · {call.get('from_number') or '-'}",
+        f"📅 {started} · {_duration(call)}",
+        f"🔗 Сделка: {_deal(call)}",
+        "",
+        SEPARATOR,
+        "",
+        transcript,
+    ]
     return "\n".join(lines)
 
 

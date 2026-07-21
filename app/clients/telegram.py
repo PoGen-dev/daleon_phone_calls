@@ -12,7 +12,9 @@ class TelegramClient:
         self.main_chat_ids = settings.telegram_main_chat_ids
         self.error_token = settings.telegram_error_bot_token.get_secret_value()
         self.error_chat_ids = settings.telegram_failure_chat_ids
-        self.http = httpx.AsyncClient(timeout=30, proxy=settings.telegram_proxy_url or None)
+        self.http = httpx.AsyncClient(
+            timeout=30, proxy=settings.telegram_proxy_url or None
+        )
 
     async def aclose(self) -> None:
         await self.http.aclose()
@@ -24,11 +26,15 @@ class TelegramClient:
         filename: str,
         chat_id: str,
         caption: str | None = None,
+        message_thread_id: int | None = None,
         content_type: str = "application/octet-stream",
     ) -> None:
         if not self.main_token or not chat_id:
             raise RuntimeError("Telegram main bot token/chat id are not configured")
         data = {"chat_id": chat_id}
+        if message_thread_id is not None:
+            data["message_thread_id"] = str(message_thread_id)
+
         if caption:
             data["caption"] = caption
         response = await self.http.post(
@@ -42,7 +48,12 @@ class TelegramClient:
             raise RuntimeError(f"Telegram API rejected audio file: {payload}")
 
     async def send(
-        self, text: str, *, chat_id: str, error_channel: bool = False
+        self,
+        text: str,
+        *,
+        chat_id: str,
+        error_channel: bool = False,
+        message_thread_id: int | None = None,
     ) -> None:
         token = self.error_token if error_channel else self.main_token
         if not token or not chat_id:
@@ -50,9 +61,12 @@ class TelegramClient:
             raise RuntimeError(
                 f"Telegram {channel} bot token/chat id are not configured"
             )
+        payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        if message_thread_id is not None:
+            payload["message_thread_id"] = message_thread_id
         response = await self.http.post(
             f"{self.base_url}/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
+            json=payload,
         )
         response.raise_for_status()
         payload = response.json()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import mimetypes
 from pathlib import PurePath
@@ -10,7 +11,12 @@ from app.clients.minio import MinioStorage
 from app.clients.telegram import TelegramClient
 from app.common.config import Settings, get_settings
 from app.common.db import postgres_pool
-from app.common.formatting import format_analysis_message, format_dead_letter_message
+from app.common.formatting import (
+    call_service_group,
+    format_analysis_message,
+    format_dead_letter_message,
+    format_transcript_message,
+)
 from app.common.kafka import commit_after, kafka_consumer, kafka_producer
 from app.common.logging import configure_logging
 from app.common.models import QualityResult
@@ -20,6 +26,118 @@ from app.common.retry import retry_or_dead_letter
 logger = logging.getLogger(__name__)
 
 TELEGRAM_DOCUMENT_CAPTION_LIMIT = 1024
+TELEGRAM_TEXT_MESSAGE_LIMIT = 4096
+
+
+@dataclass(frozen=True)
+class TelegramDestination:
+    name: str
+    chat_id: str
+    message_thread_id: int | None = None
+
+    @property
+    def notification_key(self) -> str:
+        thread = (
+            self.message_thread_id if self.message_thread_id is not None else "root"
+        )
+        return f"{self.chat_id}:{thread}:{self.name}"
+
+
+def _thread_id(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid Telegram message_thread_id value: {value!r}"
+        ) from exc
+
+
+def _destination(
+    name: str, chat_id: str, thread_id: str | int | None
+) -> TelegramDestination | None:
+    if not str(chat_id or "").strip():
+        return None
+    return TelegramDestination(
+        name=name, chat_id=str(chat_id).strip(), message_thread_id=_thread_id(thread_id)
+    )
+
+
+def _is_closed_deal(quality: QualityResult) -> bool:
+    next_step = quality.next_step
+    return bool(next_step and next_step.status == "agreed")
+
+
+def _report_topic(quality: QualityResult) -> str:
+    if quality.risk_level == "critical":
+        return "critical"
+    if _is_closed_deal(quality):
+        return "closed_deals"
+    return "other"
+
+
+def _thread_for_report_topic(settings: Settings, prefix: str, topic: str) -> str:
+    if topic == "critical":
+        return str(getattr(settings, f"telegram_{prefix}_critical_thread_id"))
+    if topic == "closed_deals":
+        return str(getattr(settings, f"telegram_{prefix}_closed_deals_thread_id"))
+    return str(getattr(settings, f"telegram_{prefix}_other_thread_id"))
+
+
+def _report_destinations(
+    settings: Settings,
+    telegram: TelegramClient,
+    call: dict[str, Any],
+    quality: QualityResult,
+) -> list[TelegramDestination]:
+    topic = _report_topic(quality)
+    destinations: list[TelegramDestination] = []
+
+    admin = _destination(
+        f"admin:{topic}",
+        settings.telegram_admin_chat_id,
+        _thread_for_report_topic(settings, "admin", topic),
+    )
+    if admin:
+        destinations.append(admin)
+
+    service_group = call_service_group(call)
+    if service_group == "toyota_nissan":
+        team = _destination(
+            f"toyota_nissan:{topic}",
+            settings.telegram_toyota_nissan_chat_id,
+            _thread_for_report_topic(settings, "toyota_nissan", topic),
+        )
+        if team:
+            destinations.append(team)
+    elif service_group == "volvo_vag":
+        team = _destination(
+            f"volvo_vag:{topic}",
+            settings.telegram_volvo_vag_chat_id,
+            _thread_for_report_topic(settings, "volvo_vag", topic),
+        )
+        if team:
+            destinations.append(team)
+
+    if destinations:
+        return destinations
+
+    return [
+        TelegramDestination(name=f"legacy:{index}", chat_id=chat_id)
+        for index, chat_id in enumerate(telegram.main_chat_ids, start=1)
+    ]
+
+
+def _admin_transcript_destination(settings: Settings) -> TelegramDestination | None:
+    return _destination(
+        "admin:transcripts",
+        settings.telegram_admin_chat_id,
+        settings.telegram_admin_transcripts_thread_id,
+    )
 
 
 def _document_caption(text: str) -> str:
@@ -27,6 +145,29 @@ def _document_caption(text: str) -> str:
         return text
     suffix = "\n\n… Отчёт сокращён из-за лимита подписи Telegram."
     return f"{text[: TELEGRAM_DOCUMENT_CAPTION_LIMIT - len(suffix)].rstrip()}{suffix}"
+
+
+def _message_chunks(text: str, *, limit: int = TELEGRAM_TEXT_MESSAGE_LIMIT) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def process_notification(
@@ -45,18 +186,29 @@ async def process_notification(
     if not call or call.get("score") is None:
         raise ValueError(f"No analysis for call_id={call_id}")
     quality = QualityResult.model_validate(call)
-    if not telegram.main_chat_ids:
-        raise RuntimeError("TELEGRAM_CHAT_IDS is empty")
-    pending_chat_ids = []
-    for chat_id in telegram.main_chat_ids:
-        if not await repo.notification_exists(event_id, chat_id, call_id, "main"):
-            pending_chat_ids.append(chat_id)
+    report_destinations = _report_destinations(settings, telegram, call, quality)
+    transcript_destination = _admin_transcript_destination(settings)
+    if not report_destinations and transcript_destination is None:
+        raise RuntimeError(
+            "Telegram report destinations are empty. Configure TELEGRAM_ADMIN_CHAT_ID / team chat ids or TELEGRAM_CHAT_IDS."
+        )
 
+    pending_report_destinations = []
+    for destination in report_destinations:
+        if not await repo.notification_exists(event_id, destination.notification_key, call_id, "main"):
+            pending_report_destinations.append(destination)
+
+    pending_transcript_destination = None
+    if transcript_destination is not None and not await repo.notification_exists(
+        event_id, transcript_destination.notification_key, call_id, "main"
+    ):
+        pending_transcript_destination = transcript_destination
+ 
     audio = None
     audio_filename = None
     audio_content_type = "application/octet-stream"
     audio_object_name = call.get("audio_object_name")
-    if storage and audio_object_name and pending_chat_ids:
+    if storage and audio_object_name and (pending_report_destinations or pending_transcript_destination):
         audio = await storage.download(str(audio_object_name))
         audio_filename = str(
             call.get("audio_filename")
@@ -71,21 +223,48 @@ async def process_notification(
         quality,
         timezone_name=settings.mango_default_timezone,
     )
-    for chat_id in pending_chat_ids:
+    for destination in pending_report_destinations:
         if audio is not None and audio_filename:
             await telegram.send_audio_file(
                 audio,
                 filename=audio_filename,
-                chat_id=chat_id,
+                chat_id=destination.chat_id,
                 caption=_document_caption(message),
+                message_thread_id=destination.message_thread_id,
                 content_type=audio_content_type,
             )
         else:
-            await telegram.send(message, chat_id=chat_id)
+            await telegram.send(message, chat_id=destination.chat_id, message_thread_id=destination.message_thread_id)
+        await repo.save_notification(event_id, destination.notification_key, call_id, "main")
 
-        await repo.save_notification(event_id, chat_id, call_id, "main")
+    if pending_transcript_destination is not None:
+        transcript_message = format_transcript_message(call, timezone_name=settings.mango_default_timezone)
+        if audio is not None and audio_filename:
+            await telegram.send_audio_file(
+                audio,
+                filename=audio_filename,
+                chat_id=pending_transcript_destination.chat_id,
+                caption=_document_caption(transcript_message),
+                message_thread_id=pending_transcript_destination.message_thread_id,
+                content_type=audio_content_type,
+            )
+        for chunk in _message_chunks(transcript_message):
+            await telegram.send(
+                chunk,
+                chat_id=pending_transcript_destination.chat_id,
+                message_thread_id=pending_transcript_destination.message_thread_id,
+            )
+        await repo.save_notification(event_id, pending_transcript_destination.notification_key, call_id, "main")
+
     await repo.mark_call_status(call_id, "notified")
-    logger.info("Telegram notification sent", extra={"call_id": call_id})
+    logger.info(
+        "Telegram notification sent",
+        extra={
+            "call_id": call_id,
+            "report_destinations": [destination.name for destination in pending_report_destinations],
+            "transcript_destination": pending_transcript_destination.name if pending_transcript_destination else None,
+        },
+    )
 
 
 async def process_dead_letter(

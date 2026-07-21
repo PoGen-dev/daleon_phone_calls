@@ -310,6 +310,7 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
         "recording_url": "https://example.test",
         "audio_object_name": "c1/call.mp3",
         "to_number": "7 (812) 760-80-26",
+        "transcript": "Менеджер: Здравствуйте.\nКлиент: Хочу записаться.",
         "raw": {},
         **result,
     }
@@ -337,18 +338,20 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
     await telegram_worker.process_notification(
         payload, repo=repo, telegram=telegram, settings=settings, storage=storage
     )
-    assert telegram.send.await_count == 0
-    assert telegram.send_audio_file.await_count == 2
+    assert telegram.send.await_count >= 1
+    assert telegram.send_audio_file.await_count == 3
     first_audio_call = telegram.send_audio_file.await_args_list[0]
     assert "РИСК СРЫВА" in first_audio_call.kwargs["caption"]
-    assert "Автосервис: Toyota" in first_audio_call.kwargs["caption"]
+    assert "Автосервис: Toyota (+7 (812) 760-80-26)" in first_audio_call.kwargs["caption"]
     assert "Запись MinIO" not in first_audio_call.kwargs["caption"]
-
+    assert first_audio_call.kwargs["chat_id"] == "admin-chat"
+    assert first_audio_call.kwargs["message_thread_id"] == 11
     telegram.send_audio_file.assert_any_await(
         b"audio",
         filename="call.mp3",
-        chat_id="main-1",
+        chat_id="admin-chat",
         caption=first_audio_call.kwargs["caption"],
+        message_thread_id=11,
         content_type="audio/mpeg",
     )
     storage.presigned_download_url.assert_not_awaited()

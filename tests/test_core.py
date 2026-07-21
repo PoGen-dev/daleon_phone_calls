@@ -6,7 +6,12 @@ import pytest
 from pydantic import ValidationError
 
 from app.common.config import Settings, get_settings
-from app.common.formatting import format_analysis_message, format_dead_letter_message
+from app.common.formatting import (
+    call_service_group,
+    format_analysis_message,
+    format_transcript_message,
+    format_dead_letter_message,
+)
 from app.common.models import (
     CallRecord,
     QualityCriteria,
@@ -120,7 +125,8 @@ def test_analysis_message_matches_business_template() -> None:
     assert "👤 user2 · incoming · 79990000000" in message
     assert "07.05.2026 21:00 · 3:44" in message
     assert "👋75 · 🔍60 · 🔥20 · 🎯80 · 🛡40 · 🏁40" in message
-    assert "Автосервис: Nissan" in message
+    assert call_service_group({"to_number": "+7 (812) 615-85-10"}) == "toyota_nissan"
+    assert "Автосервис: Nissan (+7 (812) 615-85-10)" in message
     assert "Сделка: 42" in message
     assert "Оценка: 60, взвешенная" in message
     assert "Подробнее" not in message
@@ -160,7 +166,7 @@ def test_analysis_message_hides_minio_download_link_and_empty_phrases() -> None:
     )
     assert "Звонок:" not in message
     assert "Запись MinIO" not in message
-    assert "Автосервис: Volvo" in message
+    assert "Автосервис: Volvo (+7 (812) 425-30-26)" in message
     assert "Почему риск" not in message
     assert "❌ Ошибки" not in message
 
@@ -179,3 +185,17 @@ def test_dead_letter_format_and_prompt() -> None:
         "❗ ОШИБКА" in message and "Звонок: c1" in message and "Попыток: 3" in message
     )
     assert "текст звонка" in build_quality_user_prompt("текст звонка")
+
+
+def test_format_transcript_message() -> None:
+    message = format_transcript_message(
+        {
+            "id": "x",
+            "to_number": "+7 (812) 425-30-09",
+            "transcript": "Менеджер: Здравствуйте.\nКлиент: Добрый день.",
+            "raw": {},
+        }
+    )
+    assert "ТРАНСКРИБИРОВАННЫЙ ЗВОНОК" in message
+    assert "Автосервис: VAG (+7 (812) 425-30-09)" in message
+    assert "Менеджер: Здравствуйте." in message

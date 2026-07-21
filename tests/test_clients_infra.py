@@ -81,18 +81,30 @@ async def test_telegram_sends_to_both_channels_and_validates_response(
     )
     assert telegram.main_chat_ids == ["main-chat", "main-chat-2"]
     assert telegram.error_chat_ids == ["error-chat", "error-chat-2"]
-    await telegram.send("main", chat_id="main-chat")
+    await telegram.send("main", chat_id="main-chat", message_thread_id=10)
     await telegram.send("error", chat_id="error-chat", error_channel=True)
     await telegram.send_audio_file(
-        b"audio", filename="call.mp3", chat_id="main-chat", caption="Запись"
+        b"audio",
+        filename="call.mp3",
+        chat_id="main-chat",
+        caption="Запись",
+        message_thread_id=11,
     )
     assert "/botmain-token/sendMessage" in telegram.http.post.await_args_list[0].args[0]
+    assert (
+        telegram.http.post.await_args_list[0].kwargs["json"]["message_thread_id"] == 10
+    )
     assert (
         telegram.http.post.await_args_list[1].kwargs["json"]["chat_id"] == "error-chat"
     )
     audio_request = telegram.http.post.await_args_list[2]
     assert "/botmain-token/sendDocument" in audio_request.args[0]
     assert audio_request.kwargs["data"] == {"chat_id": "main-chat", "caption": "Запись"}
+    assert audio_request.kwargs["data"] == {
+        "chat_id": "main-chat",
+        "message_thread_id": "11",
+        "caption": "Запись",
+    }
     assert audio_request.kwargs["files"]["document"] == (
         "call.mp3",
         b"audio",
