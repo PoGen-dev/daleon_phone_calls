@@ -313,3 +313,59 @@ def test_recording_content_accepts_declared_audio() -> None:
         content=b"opaque audio", headers={"content-type": "audio/mpeg; charset=binary"}
     )
     assert MangoClient._audio_content(response) == b"opaque audio"
+
+
+def test_resolve_mango_user_by_extension_and_sip(settings) -> None:
+    client = MangoClient(settings)
+    user = {
+        "general": {
+            "name": "Иван Иванов",
+            "user_id": 42,
+            "mobile": "79990001122",
+            "sips": [{"number": "user2@vpbx400100296.mangosip.ru"}],
+        },
+        "telephony": {
+            "extension": "11",
+            "outgoingline": "78127608026",
+            "line_id": 100,
+            "numbers": [
+                {"number": "sip:user2@vpbx400100296.mangosip.ru", "protocol": "sip"},
+                {
+                    "number": "8127608026",
+                    "number_normalized": "78127608026",
+                    "protocol": "tel",
+                },
+            ],
+        },
+        "groups": [7],
+    }
+    row = {
+        "to_extension": "11",
+        "to_number": "sip:user2@vpbx400100296.mangosip.ru",
+    }
+    assert client.resolve_user(row, [user]) == user
+    assert client.resolve_user("sip:user2@vpbx400100296.mangosip.ru", [user]) == user
+    summary = client.employee_summary(user)
+    assert summary["name"] == "Иван Иванов"
+    assert summary["extension"] == "11"
+    assert summary["outgoingline"] == "78127608026"
+    assert summary["phone_numbers"] == ["78127608026"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_find_mango_user(settings) -> None:
+    client = MangoClient(settings)
+    user = {
+        "general": {"name": "Иван"},
+        "telephony": {
+            "extension": "11",
+            "numbers": [{"number": "sip:user2@example.mangosip.ru", "protocol": "sip"}],
+        },
+    }
+    client.request = AsyncMock(return_value={"users": user})
+    assert await client.find_user("11") == user
+    endpoint, payload = client.request.await_args.args
+    assert endpoint == "config/users/request"
+    assert payload["extension"] == "11"
+    assert "general.sips" in payload["ext_fields"]
+    await client.aclose()

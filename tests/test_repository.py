@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.common.models import CallRecord, OutboxMessage, QualityResult
+from app.common.models import (
+    CallClassification,
+    CallRecord,
+    OutboxMessage,
+    QualityResult,
+)
 from app.common.repository import Repository, _json, _to_primitive
 
 
@@ -119,6 +124,34 @@ async def test_transcription_operations() -> None:
     conn.fetchval.side_effect = [1, "transcript"]
     assert await repo.transcription_exists("c1")
     assert await repo.get_transcription("c1") == "transcript"
+
+
+pytest.mark.asyncio
+
+
+async def test_classification_operations() -> None:
+    conn = Connection()
+    repo = Repository(Pool(conn))
+    result = CallClassification(
+        call_type="critical",
+        reason="Серьёзная ошибка",
+        critical_errors=["Неверная информация"],
+        confidence="high",
+    )
+    await repo.save_classification(
+        call_id="c1", classification=result, model="mini", raw={"x": 1}
+    )
+    assert conn.execute.await_count == 2
+    insert_args = conn.execute.await_args_list[0].args
+    assert insert_args[1:6] == (
+        "c1",
+        "critical",
+        "Серьёзная ошибка",
+        '["Неверная информация"]',
+        "high",
+    )
+    conn.fetchval.return_value = True
+    assert await repo.classification_exists("c1")
 
 
 @pytest.mark.asyncio

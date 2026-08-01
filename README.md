@@ -3,10 +3,11 @@
 Асинхронный pipeline обработки звонков MANGO OFFICE:
 
 1. `mango-worker` опрашивает Mango, проверяет аудио, сохраняет его в MinIO, а метаданные и Kafka outbox — в PostgreSQL.
-2. `transcriber-worker` получает объект MinIO из Kafka, отправляет его в Base64 на JSON STT endpoint OpenRouter и
-   сохраняет транскрипцию `gpt-4o-transcribe`.
+2. `transcriber-worker` получает объект MinIO из Kafka, отправляет его в Base64 на JSON STT endpoint OpenRouter,
+   разделяет реплики по спикерам и отдельным ИИ-запросом классифицирует звонок.
 3. `quality-worker` анализирует текст через `gpt-4o-mini`, сохраняет метрики и публикует задачу уведомления.
-4. `telegram-worker` отправляет результат основным ботом, а DLQ после третьей ошибки — отдельным ботом.
+4. `telegram-worker` отправляет все бизнес-отчёты, включая критические звонки, основным ботом. Только технические
+   DLQ-ошибки после третьей попытки отправляются отдельным error-ботом.
 
 Каждый Kafka-task содержит `attempt`. При ошибке задача повторно публикуется в исходный topic; после третьей попытки
 создаётся событие `dead_letter`. Первый воркер публикует события через transactional outbox: сохранение звонка и
@@ -21,6 +22,8 @@ cp .env.example .env
 # MANGO_DEFAULT_TIMEZONE задаёт часовой пояс дат в Telegram, по умолчанию Europe/Moscow
 # MINIO_PUBLIC_BASE_URL должен быть адресом MinIO, открываемым из Telegram
 # OPENROUTER_TRANSCRIBE_READ_TIMEOUT_SECONDS задаёт ожидание ответа STT, по умолчанию 900 секунд
+# OPENAI_CLASSIFICATION_MODEL задаёт модель отдельного этапа классификации
+# MANGO_ENRICH_USER_METADATA=true включает привязку SIP/добавочного к справочнику сотрудников Mango
 docker compose up --build -d
 docker compose ps
 ```
@@ -44,6 +47,16 @@ docker compose ps
 
 Топики с тремя partition создаёт одноразовый сервис `kafka-init`. Consumer offsets фиксируются только после успешной
 обработки, повторной публикации или переноса в DLQ.
+
+Если настроены `TELEGRAM_ADMIN_CHAT_ID` и `TELEGRAM_ADMIN_TRANSCRIPTS_THREAD_ID`, в тему транскрипций отправляются
+два компактных документа вместо длинного сообщения:
+
+- исходный аудиофайл звонка с короткой служебной подписью;
+- `<имя_аудио>_transcript.txt` в UTF-8, содержащий только транскрибированный диалог, уже разбитый по ролям.
+
+Аудио и TXT имеют отдельные ключи идемпотентности. Если Telegram принял аудио, но временно отклонил TXT, при retry
+повторно отправится только отсутствующий TXT-файл.
+
 
 ## OpenRouter transcription timeout
 
@@ -72,7 +85,8 @@ docker compose ps
 
 - `calls`: метаданные Mango, статус и путь объекта MinIO.
 - `transcriptions`: текст по ролям, исходный STT-текст, модель и результат проверки сохранности слов.
-- `quality_scores`: риск, итог, ошибки, рекомендация и шесть метрик.
+- `call_classifications`: тип звонка, причина классификации, критические ошибки, уверенность и сырой ответ модели.
+- `quality_scores`: риск, итог, обычные ошибки, рекомендация и шесть метрик.
 - `notifications`: ключи идемпотентности Telegram-событий для каждого `chat_id`.
 - `worker_state`: cursor опроса Mango.
 - `outbox_events`: гарантированная публикация событий первого воркера в Kafka.
@@ -85,11 +99,39 @@ docker compose ps
 а не акустическая diarization: код разрешает только пунктуацию и границы реплик, затем проверяет полное совпадение слов
 с исходным текстом. При любом добавлении, удалении или перестановке слов сохраняется исходный текст с неизвестной ролью.
 
+После разделения спикеров выполняется отдельный запрос классификации. Возможные типы: `Запись`, `Продажи`,
+`Доставка`, `Консультация`, `Готовая сделка`, `Критическая`. `Консультация` используется как fallback. Для
+`Критической` модель обязана вернуть конкретный список `critical_errors`; технические ошибки интеграций к этой
+категории не относятся. Этап идемпотентен: при retry сохранённая классификация не запрашивается повторно.
+
 Анализ использует диапазоны оценки 0-25, 26-50, 51-75 и 76-100, веса критериев и дословные
 цитаты-доказательства. Код проверяет наличие каждой цитаты в транскрипте и сам пересчитывает итоговый балл. В
 `quality_raw.analysis` сохраняются статусы критериев, доказательства, отдельные возражения, этапы их обработки и
 согласованный следующий шаг. Исходный STT и результат разметки ролей доступны в `transcription_raw` через
 `GET /calls/{call_id}`.
+
+
+## Поиск сотрудника по SIP или добавочному
+
+В базовой статистике Mango поле `to_number` может содержать внутренний SIP URI, например
+`sip:user2@vpbx400100296.mangosip.ru`, а фактический добавочный находится рядом в `to_extension`. Для разового
+поиска сотрудника и связанных номеров выполните:
+
+```bash
+docker compose run --rm mango-worker python scripts/lookup_mango_user.py 11
+docker compose run --rm mango-worker python scripts/lookup_mango_user.py "sip:user2@vpbx400100296.mangosip.ru"
+```
+
+Команда выводит ФИО, `user_id`, отдел, должность, мобильный, исходящую линию, `line_id`, SIP-учётки, телефонные
+номера и группы. Для автоматического добавления этих данных в `calls.raw.mango_employee` включите:
+
+```env
+MANGO_ENRICH_USER_METADATA=true
+MANGO_USERS_CACHE_TTL_SECONDS=3600
+```
+
+Справочник сотрудников кэшируется, поэтому штатный polling звонков не создаёт запрос к API конфигурации каждые
+30 секунд. Если enrichment временно недоступен, загрузка звонков продолжается без него.
 
 ## Проверка
 
@@ -111,6 +153,7 @@ docker compose logs --tail=100 mango-worker transcriber-worker quality-worker te
 docker compose exec minio mc ls --recursive local/mango-calls
 docker compose exec postgres psql -U app -d calls -c "select id,status,audio_object_name from calls order by created_at desc limit 10"
 docker compose exec postgres psql -U app -d calls -c "select call_id,left(transcript,80) from transcriptions order by created_at desc limit 10"
+docker compose exec postgres psql -U app -d calls -c "select call_id,call_type,confidence from call_classifications order by created_at desc limit 10"
 docker compose exec postgres psql -U app -d calls -c "select call_id,score,risk_level from quality_scores order by created_at desc limit 10"
 docker compose exec postgres psql -U app -d calls -c "select id,topic,attempts,last_error from outbox_events where published_at is null order by id"
 docker compose exec kafka kafka-console-consumer --bootstrap-server kafka:9092 --topic calls.dead_letter --from-beginning --max-messages 1
@@ -135,6 +178,7 @@ docker compose start mango-worker
 ```bash
 docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations/002_telegram_chat_ids.sql
 docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations/003_outbox.sql
+docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations/004_call_classifications.sql
 ```
 
 ## Production

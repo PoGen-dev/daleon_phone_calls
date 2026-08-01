@@ -7,10 +7,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.clients.minio import MinioStorage
-from app.clients.openai_qa import QUALITY_JSON_SCHEMA, OpenAIQaClient
+from app.clients.openai_qa import (
+    CALL_CLASSIFICATION_JSON_SCHEMA,
+    QUALITY_JSON_SCHEMA,
+    OpenAIQaClient,
+)
 from app.clients.telegram import TelegramClient
 from app.common import db, kafka
-from app.common.models import QualityResult
+from app.common.models import CallClassification, QualityResult
 from app.common.retry import retry_or_dead_letter
 from app.prompts.quality import QUALITY_SYSTEM_PROMPT
 
@@ -77,7 +81,7 @@ async def test_telegram_sends_to_both_channels_and_validates_response(
         raise_for_status=MagicMock(), json=lambda: {"ok": False, "description": "bad"}
     )
     telegram.http = SimpleNamespace(
-        post=AsyncMock(side_effect=[ok, ok, ok, rejected]), aclose=AsyncMock()
+        post=AsyncMock(side_effect=[ok, ok, ok, ok, rejected]), aclose=AsyncMock()
     )
     assert telegram.main_chat_ids == ["main-chat", "main-chat-2"]
     assert telegram.error_chat_ids == ["error-chat", "error-chat-2"]
@@ -90,6 +94,14 @@ async def test_telegram_sends_to_both_channels_and_validates_response(
         caption="Запись",
         message_thread_id=11,
     )
+    await telegram.send_document(
+        "Менеджер: Здравствуйте.\n".encode("utf-8"),
+        filename="call_transcript.txt",
+        chat_id="main-chat",
+        caption="Транскрипция",
+        message_thread_id=11,
+        content_type="text/plain; charset=utf-8",
+    )
     assert "/botmain-token/sendMessage" in telegram.http.post.await_args_list[0].args[0]
     assert (
         telegram.http.post.await_args_list[0].kwargs["json"]["message_thread_id"] == 10
@@ -99,7 +111,6 @@ async def test_telegram_sends_to_both_channels_and_validates_response(
     )
     audio_request = telegram.http.post.await_args_list[2]
     assert "/botmain-token/sendDocument" in audio_request.args[0]
-    assert audio_request.kwargs["data"] == {"chat_id": "main-chat", "caption": "Запись"}
     assert audio_request.kwargs["data"] == {
         "chat_id": "main-chat",
         "message_thread_id": "11",
@@ -109,6 +120,12 @@ async def test_telegram_sends_to_both_channels_and_validates_response(
         "call.mp3",
         b"audio",
         "application/octet-stream",
+    )
+    transcript_request = telegram.http.post.await_args_list[3]
+    assert transcript_request.kwargs["files"]["document"] == (
+        "call_transcript.txt",
+        "Менеджер: Здравствуйте.\n".encode("utf-8"),
+        "text/plain; charset=utf-8",
     )
     with pytest.raises(RuntimeError, match="rejected"):
         await telegram.send("bad", chat_id="main-chat")
@@ -227,6 +244,44 @@ async def test_openrouter_client_transcribes_and_scores(
     await ai.aclose()
     fake.close.assert_awaited_once()
     stt_http.aclose.assert_awaited_once()
+
+
+pytest.mark.asyncio
+
+
+async def test_openrouter_classifies_call_with_separate_request(
+    settings, monkeypatch
+) -> None:
+    payload = {
+        "call_type": "critical",
+        "reason": "Сотрудник отказал в оплаченной услуге",
+        "critical_errors": ["Отказ в оплаченной услуге"],
+        "confidence": "high",
+    }
+    completion = Dumpable({"choices": []})
+    completion.choices = [
+        SimpleNamespace(
+            message=SimpleNamespace(content=__import__("json").dumps(payload))
+        )
+    ]
+    fake = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(return_value=completion))
+        ),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake)
+    )
+    ai = OpenAIQaClient(settings)
+    result, raw = await ai.classify_call(transcript="Менеджер: Отказываю.")
+    assert isinstance(result, CallClassification)
+    assert result.call_type == "critical"
+    assert raw["classification"]["critical_errors"] == ["Отказ в оплаченной услуге"]
+    request = fake.chat.completions.create.await_args.kwargs
+    assert request["model"] == settings.openai_classification_model
+    assert request["response_format"]["json_schema"] == CALL_CLASSIFICATION_JSON_SCHEMA
+    await ai.aclose()
 
 
 @pytest.mark.asyncio

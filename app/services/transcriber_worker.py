@@ -29,6 +29,8 @@ async def process_task(
     call_id = payload.get("call_id")
     if not call_id:
         raise ValueError("Kafka payload has no call_id")
+
+    transcript: str | None = None
     if not await repo.transcription_exists(call_id):
         object_name = payload.get("object_name")
         if not object_name:
@@ -56,8 +58,31 @@ async def process_task(
             len(transcript),
             role_raw.get("validated"),
         )
+
+    if not await repo.classification_exists(call_id):
+        transcript = transcript or await repo.get_transcription(call_id)
+        if not transcript:
+            raise ValueError(f"No transcription for call_id={call_id}")
+        classification, classification_raw = await ai.classify_call(
+            transcript=transcript
+        )
+        await repo.save_classification(
+            call_id=call_id,
+            classification=classification,
+            model=settings.openai_classification_model,
+            raw=classification_raw,
+        )
+        logger.info(
+            "Call classified: call_id=%s call_type=%s confidence=%s",
+            call_id,
+            classification.call_type,
+            classification.confidence,
+        )
+
     event = AnalysisRequestedEvent(call_id=call_id)
-    await publish_json(producer, settings.topic_to_analyze, event.model_dump(mode="json"), key=call_id)
+    await publish_json(
+        producer, settings.topic_to_analyze, event.model_dump(mode="json"), key=call_id
+    )
 
 
 async def run() -> None:
@@ -66,19 +91,34 @@ async def run() -> None:
     async with (
         postgres_pool(settings) as pg,
         kafka_producer(settings) as producer,
-        kafka_consumer(settings, topic=settings.topic_to_transcribe, group_suffix="transcriber") as consumer,
+        kafka_consumer(
+            settings, topic=settings.topic_to_transcribe, group_suffix="transcriber"
+        ) as consumer,
     ):
         repo = Repository(pg)
         storage = MinioStorage(settings)
         ai = OpenAIQaClient(settings)
         try:
             async for record in consumer:
-                payload = record.value if isinstance(record.value, dict) else {"invalid_payload": record.value}
+                payload = (
+                    record.value
+                    if isinstance(record.value, dict)
+                    else {"invalid_payload": record.value}
+                )
                 call_id = payload.get("call_id")
                 try:
-                    await process_task(payload, repo=repo, storage=storage, ai=ai, producer=producer, settings=settings)
+                    await process_task(
+                        payload,
+                        repo=repo,
+                        storage=storage,
+                        ai=ai,
+                        producer=producer,
+                        settings=settings,
+                    )
                 except Exception as exc:
-                    logger.exception("Transcription task failed", extra={"call_id": call_id})
+                    logger.exception(
+                        "Transcription task failed", extra={"call_id": call_id}
+                    )
                     moved = await retry_or_dead_letter(
                         producer=producer,
                         settings=settings,
@@ -88,7 +128,9 @@ async def run() -> None:
                         service="transcriber-worker",
                     )
                     if call_id:
-                        status = "transcription_failed" if moved else "transcription_retry"
+                        status = (
+                            "transcription_failed" if moved else "transcription_retry"
+                        )
                         await repo.mark_call_status(call_id, status, str(exc))
                 await commit_after(record, consumer)
         finally:

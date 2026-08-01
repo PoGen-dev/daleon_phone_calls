@@ -6,6 +6,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.common.models import QualityCriteria, QualityResult
 
+CALL_TYPE_LABELS = {
+    "appointment": "Запись",
+    "sales": "Продажи",
+    "delivery": "Доставка",
+    "consultation": "Консультация",
+    "completed_deal": "Готовая сделка",
+    "critical": "Критическая",
+}
+
 SEPARATOR = "━━━━━━━━━━━━"
 
 
@@ -40,12 +49,24 @@ def _date(call: dict[str, Any], *, timezone_name: str) -> str:
         return "-"
 
 
+def _mango_employee(call: dict[str, Any]) -> dict[str, Any]:
+    raw = call.get("raw") or {}
+    employee = raw.get("mango_employee") or {}
+    return employee if isinstance(employee, dict) else {}
+
+
 def _manager(call: dict[str, Any]) -> str:
     raw = call.get("raw") or {}
+    employee = _mango_employee(call)
+    general = employee.get("general") or {}
+    telephony = employee.get("telephony") or {}
     return str(
         raw.get("manager_name")
         or raw.get("user_name")
+        or (general.get("name") if isinstance(general, dict) else None)
         or raw.get("from_extension")
+        or raw.get("to_extension")
+        or (telephony.get("extension") if isinstance(telephony, dict) else None)
         or "-"
     )
 
@@ -99,7 +120,10 @@ def _normalize_phone(value: Any) -> str:
 
 def _called_phone_candidates(call: dict[str, Any]) -> list[Any]:
     raw = call.get("raw") or {}
-    return [
+    employee = _mango_employee(call)
+    general = employee.get("general") or {}
+    telephony = employee.get("telephony") or {}
+    candidates: list[Any] = [
         call.get("to_number"),
         call.get("called_number"),
         call.get("destination_number"),
@@ -108,6 +132,20 @@ def _called_phone_candidates(call: dict[str, Any]) -> list[Any]:
         raw.get("destination_number"),
         raw.get("line_number"),
     ]
+    if isinstance(telephony, dict):
+        candidates.append(telephony.get("outgoingline"))
+        numbers = telephony.get("numbers") or []
+        if isinstance(numbers, dict):
+            numbers = [numbers]
+        if isinstance(numbers, list):
+            for number in numbers:
+                if isinstance(number, dict) and number.get("protocol") == "tel":
+                    candidates.extend(
+                        [number.get("number_normalized"), number.get("number")]
+                    )
+    if isinstance(general, dict):
+        candidates.append(general.get("mobile"))
+    return candidates
 
 
 def _format_phone(value: str) -> str:
@@ -201,6 +239,17 @@ def _visible_errors(errors: list[str]) -> list[str]:
     return result
 
 
+def _call_type_label(call: dict[str, Any]) -> str | None:
+    value = str(call.get("call_type") or "").strip()
+    return CALL_TYPE_LABELS.get(value)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 def format_analysis_message(
     call: dict[str, Any],
     quality: QualityResult,
@@ -208,11 +257,11 @@ def format_analysis_message(
     timezone_name: str = "Europe/Moscow",
     recording_download_url: str | None = None,
 ) -> str:
-    title = (
-        "🚨 РИСК СРЫВА СДЕЛКИ"
-        if quality.risk_level == "critical"
-        else "📞 АНАЛИЗ ЗВОНКА"
+    call_type = str(call.get("call_type") or "").strip()
+    is_critical_call = call_type == "critical" or (
+        not call_type and quality.risk_level == "critical"
     )
+    title = "🚨 КРИТИЧЕСКИЙ ЗВОНОК" if is_critical_call else "📞 АНАЛИЗ ЗВОНКА"
     started = _date(call, timezone_name=timezone_name)
     lines = [
         title,
@@ -222,6 +271,9 @@ def format_analysis_message(
         f"🏢 Автосервис: {_service_title(call)}",
         f"🔗 Сделка: {_deal(call)}",
     ]
+    call_type_label = _call_type_label(call)
+    if call_type_label:
+        lines.append(f"🏷 Тип звонка: {call_type_label}")
 
     lines.extend(["", SEPARATOR, ""])
     risk_reason = _risk_reason(quality)
@@ -232,6 +284,9 @@ def format_analysis_message(
     errors = _visible_errors(quality.errors)
     if errors:
         lines.extend([f"❌ Ошибки: {'; '.join(errors)}", ""])
+    critical_errors = _string_list(call.get("critical_errors"))
+    if critical_errors:
+        lines.extend([f"🚨 Критические ошибки: {'; '.join(critical_errors)}", ""])
 
     lines.extend(
         [
@@ -250,11 +305,10 @@ def format_analysis_message(
     return "\n".join(lines)
 
 
-def format_transcript_message(
+def format_transcript_caption(
     call: dict[str, Any], *, timezone_name: str = "Europe/Moscow"
 ) -> str:
     started = _date(call, timezone_name=timezone_name)
-    transcript = str(call.get("transcript") or "").strip() or "Транскрипт отсутствует."
     lines = [
         "📝 ТРАНСКРИБИРОВАННЫЙ ЗВОНОК",
         "",
@@ -262,11 +316,10 @@ def format_transcript_message(
         f"👤 {_manager(call)} · {call.get('direction') or '-'} · {call.get('from_number') or '-'}",
         f"📅 {started} · {_duration(call)}",
         f"🔗 Сделка: {_deal(call)}",
-        "",
-        SEPARATOR,
-        "",
-        transcript,
     ]
+    call_type_label = _call_type_label(call)
+    if call_type_label:
+        lines.append(f"🏷 Тип звонка: {call_type_label}")
     return "\n".join(lines)
 
 
@@ -281,5 +334,20 @@ def format_dead_letter_message(payload: dict[str, Any]) -> str:
             f"Звонок: {task.get('call_id', '-')}",
             f"Попыток: {payload.get('attempts', '-')}",
             f"Ошибка: {payload.get('error', '-')}",
+        ]
+    )
+
+
+def format_transcript_message(
+    call: dict[str, Any], *, timezone_name: str = "Europe/Moscow"
+) -> str:
+    transcript = str(call.get("transcript") or "").strip() or "Транскрипт отсутствует."
+    return "\n".join(
+        [
+            format_transcript_caption(call, timezone_name=timezone_name),
+            "",
+            SEPARATOR,
+            "",
+            transcript,
         ]
     )

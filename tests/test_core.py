@@ -13,6 +13,7 @@ from app.common.formatting import (
     format_dead_letter_message,
 )
 from app.common.models import (
+    CallClassification,
     CallRecord,
     QualityCriteria,
     QualityResult,
@@ -89,6 +90,27 @@ def test_models_normalize_naive_datetime_and_validate_attempt() -> None:
         )
 
 
+def test_call_classification_schema_and_normalization() -> None:
+    result = CallClassification.model_validate(
+        {
+            "call_type": "critical",
+            "reason": "Сотрудник дал опасную рекомендацию",
+            "critical_errors": [" Ошибка ", "Ошибка", ""],
+            "confidence": "high",
+        }
+    )
+    assert result.critical_errors == ["Ошибка"]
+    with pytest.raises(ValidationError):
+        CallClassification.model_validate(
+            {
+                "call_type": "unknown",
+                "reason": "-",
+                "critical_errors": [],
+                "confidence": "high",
+            }
+        )
+
+
 def test_quality_schema_rejects_invalid_scores() -> None:
     assert quality().criteria.greeting == 75
     with pytest.raises(ValidationError):
@@ -112,6 +134,8 @@ def test_serialization_handles_datetime_and_rejects_unknown() -> None:
 def test_analysis_message_matches_business_template() -> None:
     call = {
         "id": "137630",
+        "call_type": "critical",
+        "critical_errors": ["Сотрудник сообщил заведомо неверную стоимость"],
         "started_at": "2026-05-07T18:00:00+00:00",
         "finished_at": "2026-05-07T18:03:44+00:00",
         "direction": "incoming",
@@ -121,13 +145,16 @@ def test_analysis_message_matches_business_template() -> None:
         "raw": {"user_name": "user2", "deal_id": "42"},
     }
     message = format_analysis_message(call, quality())
-    assert "🚨 РИСК СРЫВА СДЕЛКИ" in message
+    assert "🚨 КРИТИЧЕСКИЙ ЗВОНОК" in message
     assert "👤 user2 · incoming · 79990000000" in message
     assert "07.05.2026 21:00 · 3:44" in message
     assert "👋75 · 🔍60 · 🔥20 · 🎯80 · 🛡40 · 🏁40" in message
     assert call_service_group({"to_number": "+7 (812) 615-85-10"}) == "toyota_nissan"
     assert "Автосервис: Nissan (+7 (812) 615-85-10)" in message
     assert "Сделка: 42" in message
+    assert "Тип звонка: Критическая" in message
+    assert "Критические ошибки: Сотрудник сообщил заведомо неверную стоимость" in message
+    assert message.index("❌ Ошибки") < message.index("🚨 Критические ошибки")
     assert "Оценка: 60, взвешенная" in message
     assert "Подробнее" not in message
 

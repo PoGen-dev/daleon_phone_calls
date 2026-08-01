@@ -13,6 +13,8 @@ def settings() -> Settings:
         mango_api_key=SecretStr("mango-key"),
         mango_api_salt=SecretStr("mango-salt"),
         openrouter_api_key=SecretStr("router-key"),
+        openai_classification_model="openai/gpt-4o-mini",
+        mango_enrich_user_metadata=False,
         telegram_bot_token=SecretStr("main-token"),
         telegram_chat_ids="main-chat,main-chat-2",
         telegram_error_bot_token=SecretStr("error-token"),

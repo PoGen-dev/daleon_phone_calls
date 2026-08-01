@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import logging
+import re
 import mimetypes
 from pathlib import PurePath
 from typing import Any
@@ -15,7 +16,7 @@ from app.common.formatting import (
     call_service_group,
     format_analysis_message,
     format_dead_letter_message,
-    format_transcript_message,
+    format_transcript_caption,
 )
 from app.common.kafka import commit_after, kafka_consumer, kafka_producer
 from app.common.logging import configure_logging
@@ -26,7 +27,7 @@ from app.common.retry import retry_or_dead_letter
 logger = logging.getLogger(__name__)
 
 TELEGRAM_DOCUMENT_CAPTION_LIMIT = 1024
-TELEGRAM_TEXT_MESSAGE_LIMIT = 4096
+TRANSCRIPT_TEXT_CONTENT_TYPE = "text/plain; charset=utf-8"
 
 
 @dataclass(frozen=True)
@@ -72,11 +73,14 @@ def _is_closed_deal(quality: QualityResult) -> bool:
     return bool(next_step and next_step.status == "agreed")
 
 
-def _report_topic(quality: QualityResult) -> str:
-    if quality.risk_level == "critical":
-        return "critical"
-    if _is_closed_deal(quality):
+def _report_topic(call: dict[str, Any], quality: QualityResult) -> str:
+    call_type = str(call.get("call_type") or "").strip()
+    if call_type == "completed_deal":
         return "closed_deals"
+    if not call_type and _is_closed_deal(quality):
+        return "closed_deals"
+    # Бизнес-критичные звонки отправляются обычным ботом в общий поток.
+    # Отдельный error-канал ниже используется только для технических DLQ-событий.
     return "other"
 
 
@@ -94,7 +98,7 @@ def _report_destinations(
     call: dict[str, Any],
     quality: QualityResult,
 ) -> list[TelegramDestination]:
-    topic = _report_topic(quality)
+    topic = _report_topic(call, quality)
     destinations: list[TelegramDestination] = []
 
     admin = _destination(
@@ -147,27 +151,29 @@ def _document_caption(text: str) -> str:
     return f"{text[: TELEGRAM_DOCUMENT_CAPTION_LIMIT - len(suffix)].rstrip()}{suffix}"
 
 
-def _message_chunks(text: str, *, limit: int = TELEGRAM_TEXT_MESSAGE_LIMIT) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-    chunks: list[str] = []
-    current = ""
-    for line in text.splitlines():
-        candidate = line if not current else f"{current}\n{line}"
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-            current = ""
-        while len(line) > limit:
-            chunks.append(line[:limit])
-            line = line[limit:]
-        current = line
-    if current:
-        chunks.append(current)
-    return chunks
+def _transcript_notification_key(destination: TelegramDestination, asset: str) -> str:
+    return f"{destination.notification_key}:{asset}"
+
+
+def _safe_filename_stem(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
+    return cleaned[:80] or "call"
+
+
+def _transcript_filename(call: dict[str, Any], audio_filename: str | None) -> str:
+    source = (
+        PurePath(audio_filename).stem
+        if audio_filename
+        else str(call.get("id") or "call")
+    )
+    return f"{_safe_filename_stem(source)}_transcript.txt"
+
+
+def _transcript_document(call: dict[str, Any]) -> bytes:
+    transcript = str(call.get("transcript") or "").strip()
+    if not transcript:
+        raise ValueError(f"No transcript text for call_id={call.get('id')}")
+    return f"{transcript}\n".encode("utf-8")
 
 
 async def process_notification(
@@ -190,25 +196,41 @@ async def process_notification(
     transcript_destination = _admin_transcript_destination(settings)
     if not report_destinations and transcript_destination is None:
         raise RuntimeError(
-            "Telegram report destinations are empty. Configure TELEGRAM_ADMIN_CHAT_ID / team chat ids or TELEGRAM_CHAT_IDS."
+            "Telegram report destinations are empty. Configure TELEGRAM_ADMIN_CHAT_ID / "
+            "team chat ids or TELEGRAM_CHAT_IDS."
         )
 
     pending_report_destinations = []
     for destination in report_destinations:
-        if not await repo.notification_exists(event_id, destination.notification_key, call_id, "main"):
+        if not await repo.notification_exists(
+            event_id, destination.notification_key, call_id, "main"
+        ):
             pending_report_destinations.append(destination)
 
-    pending_transcript_destination = None
-    if transcript_destination is not None and not await repo.notification_exists(
-        event_id, transcript_destination.notification_key, call_id, "main"
-    ):
-        pending_transcript_destination = transcript_destination
- 
+    pending_transcript_audio = False
+    pending_transcript_text = False
+    transcript_audio_key = None
+    transcript_text_key = None
+    if transcript_destination is not None:
+        transcript_audio_key = _transcript_notification_key(
+            transcript_destination, "audio"
+        )
+        transcript_text_key = _transcript_notification_key(
+            transcript_destination, "text"
+        )
+        pending_transcript_audio = not await repo.notification_exists(
+            event_id, transcript_audio_key, call_id, "main"
+        )
+        pending_transcript_text = not await repo.notification_exists(
+            event_id, transcript_text_key, call_id, "main"
+        )
+
     audio = None
     audio_filename = None
     audio_content_type = "application/octet-stream"
     audio_object_name = call.get("audio_object_name")
-    if storage and audio_object_name and (pending_report_destinations or pending_transcript_destination):
+    needs_audio = bool(pending_report_destinations or pending_transcript_audio)
+    if storage and audio_object_name and needs_audio:
         audio = await storage.download(str(audio_object_name))
         audio_filename = str(
             call.get("audio_filename")
@@ -217,6 +239,11 @@ async def process_notification(
         )
         audio_content_type = (
             mimetypes.guess_type(audio_filename)[0] or "application/octet-stream"
+        )
+    if pending_transcript_audio and (audio is None or not audio_filename):
+        raise RuntimeError(
+            f"Transcript topic requires audio file for call_id={call_id}; "
+            "storage or audio_object_name is unavailable"
         )
     message = format_analysis_message(
         call,
@@ -234,35 +261,53 @@ async def process_notification(
                 content_type=audio_content_type,
             )
         else:
-            await telegram.send(message, chat_id=destination.chat_id, message_thread_id=destination.message_thread_id)
-        await repo.save_notification(event_id, destination.notification_key, call_id, "main")
-
-    if pending_transcript_destination is not None:
-        transcript_message = format_transcript_message(call, timezone_name=settings.mango_default_timezone)
-        if audio is not None and audio_filename:
+            await telegram.send(
+                message,
+                chat_id=destination.chat_id,
+                message_thread_id=destination.message_thread_id,
+            )
+        await repo.save_notification(
+            event_id, destination.notification_key, call_id, "main"
+        )
+    if transcript_destination is not None:
+        transcript_caption = format_transcript_caption(
+            call, timezone_name=settings.mango_default_timezone
+        )
+        if pending_transcript_audio:
             await telegram.send_audio_file(
                 audio,
                 filename=audio_filename,
-                chat_id=pending_transcript_destination.chat_id,
-                caption=_document_caption(transcript_message),
-                message_thread_id=pending_transcript_destination.message_thread_id,
+                chat_id=transcript_destination.chat_id,
+                caption=_document_caption(transcript_caption),
+                message_thread_id=transcript_destination.message_thread_id,
                 content_type=audio_content_type,
             )
-        for chunk in _message_chunks(transcript_message):
-            await telegram.send(
-                chunk,
-                chat_id=pending_transcript_destination.chat_id,
-                message_thread_id=pending_transcript_destination.message_thread_id,
+            await repo.save_notification(
+                event_id, transcript_audio_key, call_id, "main"
             )
-        await repo.save_notification(event_id, pending_transcript_destination.notification_key, call_id, "main")
-
+        if pending_transcript_text:
+            await telegram.send_document(
+                _transcript_document(call),
+                filename=_transcript_filename(call, audio_filename),
+                chat_id=transcript_destination.chat_id,
+                caption="📄 Транскрипция по ролям",
+                message_thread_id=transcript_destination.message_thread_id,
+                content_type=TRANSCRIPT_TEXT_CONTENT_TYPE,
+            )
+            await repo.save_notification(event_id, transcript_text_key, call_id, "main")
     await repo.mark_call_status(call_id, "notified")
     logger.info(
         "Telegram notification sent",
         extra={
             "call_id": call_id,
-            "report_destinations": [destination.name for destination in pending_report_destinations],
-            "transcript_destination": pending_transcript_destination.name if pending_transcript_destination else None,
+            "report_destinations": [
+                destination.name for destination in pending_report_destinations
+            ],
+            "transcript_destination": (
+                transcript_destination.name if transcript_destination else None
+            ),
+            "transcript_audio_sent": pending_transcript_audio,
+            "transcript_text_sent": pending_transcript_text,
         },
     )
 

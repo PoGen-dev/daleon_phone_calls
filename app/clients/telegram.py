@@ -19,9 +19,9 @@ class TelegramClient:
     async def aclose(self) -> None:
         await self.http.aclose()
 
-    async def send_audio_file(
+    async def send_document(
         self,
-        audio: bytes,
+        content: bytes,
         *,
         filename: str,
         chat_id: str,
@@ -40,12 +40,31 @@ class TelegramClient:
         response = await self.http.post(
             f"{self.base_url}/bot{self.main_token}/sendDocument",
             data=data,
-            files={"document": (filename, audio, content_type)},
+            files={"document": (filename, content, content_type)},
         )
         response.raise_for_status()
         payload = response.json()
         if not payload.get("ok"):
-            raise RuntimeError(f"Telegram API rejected audio file: {payload}")
+            raise RuntimeError(f"Telegram API rejected document: {payload}")
+
+    async def send_audio_file(
+        self,
+        audio: bytes,
+        *,
+        filename: str,
+        chat_id: str,
+        caption: str | None = None,
+        message_thread_id: int | None = None,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        await self.send_document(
+            audio,
+            filename=filename,
+            chat_id=chat_id,
+            caption=caption,
+            message_thread_id=message_thread_id,
+            content_type=content_type,
+        )
 
     async def send(
         self,

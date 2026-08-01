@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.common.models import CallRecord, QualityResult
+from app.common.models import CallClassification, CallRecord, QualityResult
 from app.services import (
     mango_worker,
     quality_worker,
@@ -45,6 +45,19 @@ def quality() -> QualityResult:
                 "closing": 40,
             },
         }
+    )
+
+
+def classification(call_type: str = "appointment") -> CallClassification:
+    return CallClassification(
+        call_type=call_type,
+        reason="Клиент хочет записаться",
+        critical_errors=(
+            ["Сотрудник отказался оформлять уже оплаченную услугу"]
+            if call_type == "critical"
+            else []
+        ),
+        confidence="high",
     )
 
 
@@ -197,13 +210,19 @@ async def test_transcriber_processes_audio_and_continues_idempotently(
 ) -> None:
     repo = SimpleNamespace(
         transcription_exists=AsyncMock(side_effect=[False, True]),
+        classification_exists=AsyncMock(side_effect=[False, True]),
+        get_transcription=AsyncMock(return_value="Клиент: готовый текст"),
         save_transcription=AsyncMock(),
+        save_classification=AsyncMock(),
     )
     storage = SimpleNamespace(download=AsyncMock(return_value=b"audio"))
     ai = SimpleNamespace(
         transcribe=AsyncMock(return_value=("готовый текст", {"language": "ru"})),
         structure_transcript=AsyncMock(
             return_value=("Клиент: готовый текст", {"validated": True, "turns": []})
+        ),
+        classify_call=AsyncMock(
+            return_value=(classification(), {"classification": True})
         ),
     )
     publish = AsyncMock()
@@ -217,11 +236,14 @@ async def test_transcriber_processes_audio_and_continues_idempotently(
     assert saved["transcript"] == "Клиент: готовый текст"
     assert saved["language"] == "ru"
     assert saved["raw"]["source_text"] == "готовый текст"
+    repo.save_classification.assert_awaited_once()
+    assert ai.classify_call.await_args.kwargs["transcript"] == "Клиент: готовый текст"
     assert publish.await_args.args[1] == settings.topic_to_analyze
     await transcriber_worker.process_task(
         payload, repo=repo, storage=storage, ai=ai, producer=object(), settings=settings
     )
     assert storage.download.await_count == 1 and publish.await_count == 2
+    assert ai.classify_call.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -300,6 +322,18 @@ async def test_quality_worker_validates_input(settings, monkeypatch) -> None:
         )
 
 
+def test_business_critical_calls_use_normal_other_topic() -> None:
+    critical_quality = quality()
+    assert (
+        telegram_worker._report_topic({"call_type": "critical"}, critical_quality)
+        == "other"
+    )
+    assert (
+        telegram_worker._report_topic({"call_type": "completed_deal"}, critical_quality)
+        == "closed_deals"
+    )
+
+
 @pytest.mark.asyncio
 async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None:
     result = quality().model_dump(mode="json")
@@ -311,12 +345,25 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
         "audio_object_name": "c1/call.mp3",
         "to_number": "7 (812) 760-80-26",
         "transcript": "Менеджер: Здравствуйте.\nКлиент: Хочу записаться.",
+        "call_type": "critical",
+        "critical_errors": ["Сотрудник отказал клиенту в уже оплаченной услуге"],
         "raw": {},
         **result,
     }
     repo = SimpleNamespace(
         notification_exists=AsyncMock(
-            side_effect=[False, False, True, True, False, False]
+            side_effect=[
+                False,
+                False,
+                False,
+                False,
+                True,
+                True,
+                True,
+                True,
+                False,
+                False,
+            ]
         ),
         get_call_with_results=AsyncMock(return_value=call_data),
         save_notification=AsyncMock(),
@@ -325,6 +372,7 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
     telegram = SimpleNamespace(
         send=AsyncMock(),
         send_audio_file=AsyncMock(),
+        send_document=AsyncMock(),
         main_chat_ids=["main-1", "main-2"],
         error_chat_ids=["error-1", "error-2"],
     )
@@ -338,31 +386,54 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
     await telegram_worker.process_notification(
         payload, repo=repo, telegram=telegram, settings=settings, storage=storage
     )
-    assert telegram.send.await_count >= 1
+    assert telegram.send.await_count == 0
     assert telegram.send_audio_file.await_count == 3
+    assert telegram.send_document.await_count == 1
     first_audio_call = telegram.send_audio_file.await_args_list[0]
-    assert "РИСК СРЫВА" in first_audio_call.kwargs["caption"]
-    assert "Автосервис: Toyota (+7 (812) 760-80-26)" in first_audio_call.kwargs["caption"]
+    assert "КРИТИЧЕСКИЙ ЗВОНОК" in first_audio_call.kwargs["caption"]
+    assert (
+        "Автосервис: Toyota (+7 (812) 760-80-26)" in first_audio_call.kwargs["caption"]
+    )
     assert "Запись MinIO" not in first_audio_call.kwargs["caption"]
     assert first_audio_call.kwargs["chat_id"] == "admin-chat"
-    assert first_audio_call.kwargs["message_thread_id"] == 11
+    assert first_audio_call.kwargs["message_thread_id"] == 13
+    assert "Тип звонка: Критическая" in first_audio_call.kwargs["caption"]
+    assert "Критические ошибки: Сотрудник отказал" in first_audio_call.kwargs["caption"]
     telegram.send_audio_file.assert_any_await(
         b"audio",
         filename="call.mp3",
         chat_id="admin-chat",
         caption=first_audio_call.kwargs["caption"],
-        message_thread_id=11,
+        message_thread_id=13,
         content_type="audio/mpeg",
     )
     storage.presigned_download_url.assert_not_awaited()
     storage.download.assert_awaited_once_with("c1/call.mp3")
-    repo.save_notification.assert_awaited_with("e1", "main-2", "c1", "main")
+    repo.save_notification.assert_any_await(
+        "e1", "admin-chat:13:admin:other", "c1", "main"
+    )
+    repo.save_notification.assert_any_await(
+        "e1", "admin-chat:14:admin:transcripts:audio", "c1", "main"
+    )
+    repo.save_notification.assert_any_await(
+        "e1", "admin-chat:14:admin:transcripts:text", "c1", "main"
+    )
+    transcript_audio_call = telegram.send_audio_file.await_args_list[2]
+    assert "Менеджер: Здравствуйте" not in transcript_audio_call.kwargs["caption"]
+    assert "ТРАНСКРИБИРОВАННЫЙ ЗВОНОК" in transcript_audio_call.kwargs["caption"]
+    transcript_file_call = telegram.send_document.await_args_list[0]
+    assert transcript_file_call.kwargs["filename"] == "call_transcript.txt"
+    assert transcript_file_call.kwargs["content_type"] == "text/plain; charset=utf-8"
+    assert transcript_file_call.args[0].decode("utf-8") == (
+        "Менеджер: Здравствуйте.\nКлиент: Хочу записаться.\n"
+    )
     repo.mark_call_status.assert_awaited_with("c1", "notified")
     await telegram_worker.process_notification(
         payload, repo=repo, telegram=telegram, settings=settings, storage=storage
     )
     assert telegram.send.await_count == 0
-    assert telegram.send_audio_file.await_count == 2
+    assert telegram.send_audio_file.await_count == 3
+    assert telegram.send_document.await_count == 1
 
     dlq = {
         "event_id": "e2",
@@ -372,8 +443,64 @@ async def test_telegram_worker_sends_normal_and_error_messages(settings) -> None
     }
     await telegram_worker.process_dead_letter(dlq, repo=repo, telegram=telegram)
     assert telegram.send.await_args.kwargs["error_channel"] is True
-    assert telegram.send.await_count == 4
+    assert telegram.send.await_count == 2
     repo.save_notification.assert_awaited_with("e2", "error-2", "c1", "error")
+
+
+@pytest.mark.asyncio
+async def test_transcript_files_retry_only_missing_asset(settings) -> None:
+    call_data = {
+        "id": "c1",
+        "audio_object_name": "c1/call.mp3",
+        "audio_filename": "call.mp3",
+        "transcript": "Менеджер: Добрый день.\nКлиент: Здравствуйте.",
+        "raw": {},
+        **quality().model_dump(mode="json"),
+    }
+    repo = SimpleNamespace(
+        get_call_with_results=AsyncMock(return_value=call_data),
+        notification_exists=AsyncMock(
+            side_effect=[
+                True,
+                False,
+                False,
+                True,
+                True,
+                False,
+            ]
+        ),
+        save_notification=AsyncMock(),
+        mark_call_status=AsyncMock(),
+    )
+    telegram = SimpleNamespace(
+        main_chat_ids=[],
+        error_chat_ids=[],
+        send=AsyncMock(),
+        send_audio_file=AsyncMock(),
+        send_document=AsyncMock(side_effect=[RuntimeError("temporary"), None]),
+    )
+    storage = SimpleNamespace(download=AsyncMock(return_value=b"audio"))
+    payload = {"event_id": "e1", "call_id": "c1"}
+
+    with pytest.raises(RuntimeError, match="temporary"):
+        await telegram_worker.process_notification(
+            payload, repo=repo, telegram=telegram, settings=settings, storage=storage
+        )
+
+    await telegram_worker.process_notification(
+        payload, repo=repo, telegram=telegram, settings=settings, storage=storage
+    )
+
+    assert telegram.send_audio_file.await_count == 1
+    assert telegram.send_document.await_count == 2
+    storage.download.assert_awaited_once_with("c1/call.mp3")
+    repo.save_notification.assert_any_await(
+        "e1", "admin-chat:14:admin:transcripts:audio", "c1", "main"
+    )
+    repo.save_notification.assert_any_await(
+        "e1", "admin-chat:14:admin:transcripts:text", "c1", "main"
+    )
+    repo.mark_call_status.assert_awaited_once_with("c1", "notified")
 
 
 @pytest.mark.asyncio
@@ -402,6 +529,13 @@ async def test_telegram_worker_validates_payload_and_analysis(settings) -> None:
 
 @pytest.mark.asyncio
 async def test_telegram_worker_retries_only_missing_recipients(settings) -> None:
+    settings = settings.model_copy(
+        update={
+            "telegram_admin_chat_id": "",
+            "telegram_toyota_nissan_chat_id": "",
+            "telegram_volvo_vag_chat_id": "",
+        }
+    )
     call_data = {
         "id": "c1",
         "score": 80,
@@ -445,6 +579,13 @@ async def test_telegram_worker_retries_only_missing_recipients(settings) -> None
 
 @pytest.mark.asyncio
 async def test_telegram_worker_rejects_empty_recipient_lists(settings) -> None:
+    settings = settings.model_copy(
+        update={
+            "telegram_admin_chat_id": "",
+            "telegram_toyota_nissan_chat_id": "",
+            "telegram_volvo_vag_chat_id": "",
+        }
+    )
     call_data = {"id": "c1", "score": 1, **quality().model_dump(mode="json")}
     repo = SimpleNamespace(get_call_with_results=AsyncMock(return_value=call_data))
     telegram = SimpleNamespace(main_chat_ids=[], error_chat_ids=[], send=AsyncMock())

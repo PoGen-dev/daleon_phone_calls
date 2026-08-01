@@ -12,19 +12,35 @@ import httpx
 from openai import AsyncOpenAI
 
 from app.common.config import Settings
-from app.common.models import QualityResult
+from app.common.models import CallClassification, QualityResult
+from app.prompts.classification import (
+    CALL_CLASSIFICATION_SYSTEM_PROMPT,
+    build_call_classification_prompt,
+)
 from app.prompts.quality import QUALITY_SYSTEM_PROMPT, build_quality_user_prompt
-from app.prompts.transcription import TRANSCRIPT_ROLE_SYSTEM_PROMPT, build_transcript_role_prompt
+from app.prompts.transcription import (
+    TRANSCRIPT_ROLE_SYSTEM_PROMPT,
+    build_transcript_role_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
-CRITERIA_NAMES = ("greeting", "needs_discovery", "urgency", "target_action", "objection_handling", "closing")
+CRITERIA_NAMES = (
+    "greeting",
+    "needs_discovery",
+    "urgency",
+    "target_action",
+    "objection_handling",
+    "closing",
+)
 CRITERIA_PROPERTIES = {
-    name: {"type": "integer", "minimum": 0, "maximum": 100}
-    for name in CRITERIA_NAMES
+    name: {"type": "integer", "minimum": 0, "maximum": 100} for name in CRITERIA_NAMES
 }
 CRITERIA_STATUS_PROPERTIES = {
-    name: {"type": "string", "enum": ["observed", "not_observed", "not_applicable", "uncertain"]}
+    name: {
+        "type": "string",
+        "enum": ["observed", "not_observed", "not_applicable", "uncertain"],
+    }
     for name in CRITERIA_NAMES
 }
 CRITERIA_EVIDENCE_PROPERTIES = {
@@ -42,7 +58,10 @@ TRANSCRIPT_ROLE_JSON_SCHEMA: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "speaker": {"type": "string", "enum": ["manager", "client", "unknown"]},
+                        "speaker": {
+                            "type": "string",
+                            "enum": ["manager", "client", "unknown"],
+                        },
                         "text": {"type": "string"},
                     },
                     "required": ["speaker", "text"],
@@ -51,6 +70,32 @@ TRANSCRIPT_ROLE_JSON_SCHEMA: dict[str, Any] = {
             }
         },
         "required": ["turns"],
+        "additionalProperties": False,
+    },
+}
+
+CALL_CLASSIFICATION_JSON_SCHEMA: dict[str, Any] = {
+    "name": "call_classification",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "call_type": {
+                "type": "string",
+                "enum": [
+                    "appointment",
+                    "sales",
+                    "delivery",
+                    "consultation",
+                    "completed_deal",
+                    "critical",
+                ],
+            },
+            "reason": {"type": "string"},
+            "critical_errors": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        },
+        "required": ["call_type", "reason", "critical_errors", "confidence"],
         "additionalProperties": False,
     },
 }
@@ -67,7 +112,10 @@ QUALITY_JSON_SCHEMA: dict[str, Any] = {
             "summary": {"type": "string"},
             "errors": {"type": "array", "items": {"type": "string"}},
             "recommendation": {"type": "string"},
-            "analysis_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "analysis_confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+            },
             "limitations": {"type": "array", "items": {"type": "string"}},
             "criteria": {
                 "type": "object",
@@ -93,10 +141,21 @@ QUALITY_JSON_SCHEMA: dict[str, Any] = {
                     "type": "object",
                     "properties": {
                         "customer_quote": {"type": "string"},
-                        "kind": {"type": "string", "enum": ["explicit", "soft_deferral", "condition"]},
+                        "kind": {
+                            "type": "string",
+                            "enum": ["explicit", "soft_deferral", "condition"],
+                        },
                         "category": {
                             "type": "string",
-                            "enum": ["price", "timing", "trust", "need", "authority", "competitor", "other"],
+                            "enum": [
+                                "price",
+                                "timing",
+                                "trust",
+                                "need",
+                                "authority",
+                                "competitor",
+                                "other",
+                            ],
                         },
                         "manager_response_quote": {"type": ["string", "null"]},
                         "completed_steps": {
@@ -125,7 +184,10 @@ QUALITY_JSON_SCHEMA: dict[str, Any] = {
                                 ],
                             },
                         },
-                        "resolution": {"type": "string", "enum": ["resolved", "unresolved", "unclear"]},
+                        "resolution": {
+                            "type": "string",
+                            "enum": ["resolved", "unresolved", "unclear"],
+                        },
                     },
                     "required": [
                         "customer_quote",
@@ -142,7 +204,10 @@ QUALITY_JSON_SCHEMA: dict[str, Any] = {
             "next_step": {
                 "type": "object",
                 "properties": {
-                    "status": {"type": "string", "enum": ["agreed", "proposed", "absent", "unclear"]},
+                    "status": {
+                        "type": "string",
+                        "enum": ["agreed", "proposed", "absent", "unclear"],
+                    },
                     "quote": {"type": ["string", "null"]},
                 },
                 "required": ["status", "quote"],
@@ -190,7 +255,9 @@ class OpenAIQaClient:
         if settings.openrouter_http_referer:
             headers["HTTP-Referer"] = settings.openrouter_http_referer
         proxy_url = settings.openrouter_proxy_url or None
-        openrouter_http_client = httpx.AsyncClient(proxy=proxy_url) if proxy_url else None
+        openrouter_http_client = (
+            httpx.AsyncClient(proxy=proxy_url) if proxy_url else None
+        )
 
         proxy = settings.openrouter_proxy_url
 
@@ -219,10 +286,13 @@ class OpenAIQaClient:
             "pool": settings.openrouter_transcribe_pool_timeout_seconds,
         }
 
-        self.transcription_url = f"{settings.openrouter_base_url.rstrip('/')}/audio/transcriptions"
+        self.transcription_url = (
+            f"{settings.openrouter_base_url.rstrip('/')}/audio/transcriptions"
+        )
         self.transcribe_model = settings.openai_transcribe_model
         self.transcribe_language = settings.openai_transcribe_language
         self.transcript_role_model = settings.openai_transcript_role_model
+        self.classification_model = settings.openai_classification_model
         self.quality_model = settings.openai_quality_model
         self.quality_temperature = settings.openai_quality_temperature
 
@@ -230,7 +300,9 @@ class OpenAIQaClient:
         await self.client.close()
         await self.stt_http.aclose()
 
-    async def transcribe(self, *, audio: bytes, filename: str) -> tuple[str, dict[str, Any]]:
+    async def transcribe(
+        self, *, audio: bytes, filename: str
+    ) -> tuple[str, dict[str, Any]]:
         audio_format = self._audio_format(filename, audio)
         logger.info(
             "OpenRouter transcription request started: model=%s filename=%s audio_format=%s "
@@ -273,7 +345,9 @@ class OpenAIQaClient:
 
         raw = response.json()
         if not isinstance(raw, dict):
-            raise ValueError(f"OpenRouter transcription returned {type(raw).__name__}, expected object")
+            raise ValueError(
+                f"OpenRouter transcription returned {type(raw).__name__}, expected object"
+            )
         text = raw.get("text") or ""
         return str(text), raw
 
@@ -296,11 +370,16 @@ class OpenAIQaClient:
         suffix = aliases.get(suffix, suffix)
         if suffix in {"wav", "mp3", "aiff", "aac", "ogg", "flac", "m4a", "webm"}:
             return suffix
-        raise ValueError(f"Cannot determine supported audio format from filename: {filename!r}")
+        raise ValueError(
+            f"Cannot determine supported audio format from filename: {filename!r}"
+        )
 
     async def structure_transcript(self, transcript: str) -> tuple[str, dict[str, Any]]:
         if not self.transcript_role_model:
-            return f"{SPEAKER_LABELS['unknown']}: {transcript.strip()}", {"enabled": False, "validated": True}
+            return f"{SPEAKER_LABELS['unknown']}: {transcript.strip()}", {
+                "enabled": False,
+                "validated": True,
+            }
         completion = await self.client.chat.completions.create(
             model=self.transcript_role_model,
             temperature=0,
@@ -308,10 +387,17 @@ class OpenAIQaClient:
                 {"role": "system", "content": TRANSCRIPT_ROLE_SYSTEM_PROMPT},
                 {"role": "user", "content": build_transcript_role_prompt(transcript)},
             ],
-            response_format={"type": "json_schema", "json_schema": TRANSCRIPT_ROLE_JSON_SCHEMA},
+            response_format={
+                "type": "json_schema",
+                "json_schema": TRANSCRIPT_ROLE_JSON_SCHEMA,
+            },
         )
         content = completion.choices[0].message.content or "{}"
-        response_raw = completion.model_dump(mode="json") if hasattr(completion, "model_dump") else {"content": content}
+        response_raw = (
+            completion.model_dump(mode="json")
+            if hasattr(completion, "model_dump")
+            else {"content": content}
+        )
         try:
             payload = json.loads(content)
             turns = payload.get("turns")
@@ -326,8 +412,12 @@ class OpenAIQaClient:
                     raise ValueError("speaker turn has invalid speaker or empty text")
                 texts.append(text)
                 lines.append(f"{SPEAKER_LABELS[speaker]}: {text}")
-            if self._normalized_content(" ".join(texts)) != self._normalized_content(transcript):
-                raise ValueError("speaker structuring changed transcript words or their order")
+            if self._normalized_content(" ".join(texts)) != self._normalized_content(
+                transcript
+            ):
+                raise ValueError(
+                    "speaker structuring changed transcript words or their order"
+                )
             return "\n".join(lines), {
                 "enabled": True,
                 "validated": True,
@@ -344,12 +434,41 @@ class OpenAIQaClient:
                 "response": response_raw,
             }
 
+    async def classify_call(
+        self, *, transcript: str
+    ) -> tuple[CallClassification, dict[str, Any]]:
+        completion = await self.client.chat.completions.create(
+            model=self.classification_model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": CALL_CLASSIFICATION_SYSTEM_PROMPT},
+                {"role": "user", "content": build_call_classification_prompt(transcript)},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": CALL_CLASSIFICATION_JSON_SCHEMA,
+            },
+        )
+        content = completion.choices[0].message.content or "{}"
+        classification = CallClassification.model_validate(json.loads(content))
+        if classification.call_type != "critical" and classification.critical_errors:
+            classification = classification.model_copy(update={"critical_errors": []})
+        raw = (
+            completion.model_dump(mode="json")
+            if hasattr(completion, "model_dump")
+            else {"content": content}
+        )
+        raw["classification"] = classification.model_dump(mode="json")
+        return classification, raw
+
     @staticmethod
     def _normalized_content(value: str) -> str:
         normalized = unicodedata.normalize("NFKC", value).casefold()
         return re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
 
-    async def score_quality(self, *, transcript: str) -> tuple[QualityResult, dict[str, Any]]:
+    async def score_quality(
+        self, *, transcript: str
+    ) -> tuple[QualityResult, dict[str, Any]]:
         completion = await self.client.chat.completions.create(
             model=self.quality_model,
             temperature=self.quality_temperature,
@@ -361,14 +480,20 @@ class OpenAIQaClient:
         )
         content = completion.choices[0].message.content or "{}"
         quality = QualityResult.model_validate(json.loads(content))
-        raw = completion.model_dump(mode="json") if hasattr(completion, "model_dump") else {"content": content}
+        raw = (
+            completion.model_dump(mode="json")
+            if hasattr(completion, "model_dump")
+            else {"content": content}
+        )
         self._validate_quality_evidence(quality, transcript)
         model_score = quality.score
         model_criteria = quality.criteria.model_dump(mode="json")
         model_risk_level = quality.risk_level
         quality, risk_warnings = self._normalize_risk_consistency(quality)
         quality = self._normalize_criteria_scores(quality)
-        quality = quality.model_copy(update={"score": self._compute_quality_score(quality)})
+        quality = quality.model_copy(
+            update={"score": self._compute_quality_score(quality)}
+        )
         raw["quality_control"] = {
             "model_score": model_score,
             "model_criteria": model_criteria,
@@ -381,7 +506,9 @@ class OpenAIQaClient:
         return quality, raw
 
     @classmethod
-    def _validate_quality_evidence(cls, quality: QualityResult, transcript: str) -> None:
+    def _validate_quality_evidence(
+        cls, quality: QualityResult, transcript: str
+    ) -> None:
         transcript_normalized = cls._normalized_content(transcript)
         quotes: list[tuple[str, str]] = []
         if quality.criteria_status and quality.criteria_evidence:
@@ -389,18 +516,31 @@ class OpenAIQaClient:
                 status = getattr(quality.criteria_status, name)
                 evidence = getattr(quality.criteria_evidence, name)
                 if status == "observed" and not evidence:
-                    raise ValueError(f"Criterion {name} is observed but has no evidence")
-                quotes.extend((f"criteria_evidence.{name}", quote) for quote in evidence)
+                    raise ValueError(
+                        f"Criterion {name} is observed but has no evidence"
+                    )
+                quotes.extend(
+                    (f"criteria_evidence.{name}", quote) for quote in evidence
+                )
         for index, objection in enumerate(quality.objections):
-            quotes.append((f"objections[{index}].customer_quote", objection.customer_quote))
+            quotes.append(
+                (f"objections[{index}].customer_quote", objection.customer_quote)
+            )
             if objection.manager_response_quote:
-                quotes.append((f"objections[{index}].manager_response_quote", objection.manager_response_quote))
+                quotes.append(
+                    (
+                        f"objections[{index}].manager_response_quote",
+                        objection.manager_response_quote,
+                    )
+                )
         if quality.next_step and quality.next_step.quote:
             quotes.append(("next_step.quote", quality.next_step.quote))
         for field, quote in quotes:
             quote_normalized = cls._normalized_content(quote)
             if not quote_normalized or quote_normalized not in transcript_normalized:
-                raise ValueError(f"Analysis contains unsupported quote in {field}: {quote!r}")
+                raise ValueError(
+                    f"Analysis contains unsupported quote in {field}: {quote!r}"
+                )
 
     @staticmethod
     def _critical_risk_consistency_issue(quality: QualityResult) -> str | None:
@@ -409,7 +549,8 @@ class OpenAIQaClient:
         if quality.next_step and quality.next_step.status == "agreed":
             return "critical risk cannot be set when next step is agreed"
         has_unresolved_risk = any(
-            objection.kind in {"explicit", "soft_deferral"} and objection.resolution == "unresolved"
+            objection.kind in {"explicit", "soft_deferral"}
+            and objection.resolution == "unresolved"
             for objection in quality.objections
         )
         if not has_unresolved_risk:
@@ -417,7 +558,9 @@ class OpenAIQaClient:
         return None
 
     @classmethod
-    def _normalize_risk_consistency(cls, quality: QualityResult) -> tuple[QualityResult, list[str]]:
+    def _normalize_risk_consistency(
+        cls, quality: QualityResult
+    ) -> tuple[QualityResult, list[str]]:
         issue = cls._critical_risk_consistency_issue(quality)
         if issue is None:
             return quality, []
@@ -447,7 +590,9 @@ class OpenAIQaClient:
                 updates[name] = 0
             elif status in {"not_applicable", "uncertain"}:
                 updates[name] = 50
-        return quality.model_copy(update={"criteria": quality.criteria.model_copy(update=updates)})
+        return quality.model_copy(
+            update={"criteria": quality.criteria.model_copy(update=updates)}
+        )
 
     @staticmethod
     def _compute_quality_score(quality: QualityResult) -> int:

@@ -6,7 +6,12 @@ from typing import Any
 
 import asyncpg
 
-from app.common.models import CallRecord, OutboxMessage, QualityResult
+from app.common.models import (
+    CallClassification,
+    CallRecord,
+    OutboxMessage,
+    QualityResult,
+)
 from app.common.serialization import json_dumps_bytes, json_loads_bytes
 
 
@@ -82,7 +87,9 @@ class Repository:
                 audio_object_name = COALESCE(EXCLUDED.audio_object_name, calls.audio_object_name),
                 audio_filename = COALESCE(EXCLUDED.audio_filename, calls.audio_filename),
                 status = CASE
-                    WHEN calls.status IN ('recorded', 'transcribed', 'analyzed', 'notified') THEN calls.status
+                    WHEN calls.status IN (
+                        'recorded', 'transcribed', 'classified', 'analyzed', 'notified'
+                    ) THEN calls.status
                     ELSE EXCLUDED.status
                 END,
                 error = NULL
@@ -106,7 +113,9 @@ class Repository:
         )
 
     @staticmethod
-    async def _enqueue_outbox(conn: asyncpg.Connection, messages: list[OutboxMessage]) -> None:
+    async def _enqueue_outbox(
+        conn: asyncpg.Connection, messages: list[OutboxMessage]
+    ) -> None:
         for message in messages:
             await conn.execute(
                 """
@@ -151,7 +160,7 @@ class Repository:
                     """
                     UPDATE calls SET
                         status=CASE
-                            WHEN status IN ('recorded','transcribed','analyzed','notified') THEN status
+                            WHEN status IN ('recorded','transcribed','classified','analyzed','notified') THEN status
                             ELSE 'ingestion_failed'
                         END,
                         error=$2
@@ -197,9 +206,16 @@ class Repository:
                 error,
             )
 
-    async def mark_call_status(self, call_id: str, status: str, error: str | None = None) -> None:
+    async def mark_call_status(
+        self, call_id: str, status: str, error: str | None = None
+    ) -> None:
         async with self.pg.acquire() as conn:
-            await conn.execute("UPDATE calls SET status=$2, error=$3 WHERE id=$1", call_id, status, error)
+            await conn.execute(
+                "UPDATE calls SET status=$2, error=$3 WHERE id=$1",
+                call_id,
+                status,
+                error,
+            )
 
     async def get_call(self, call_id: str) -> dict[str, Any] | None:
         async with self.pg.acquire() as conn:
@@ -214,10 +230,14 @@ class Repository:
                     t.language AS transcription_language, t.raw AS transcription_raw,
                     q.score, q.risk_level, q.risk_reason,
                     q.summary, q.errors, q.recommendation, q.criteria,
-                    q.model AS quality_model, q.raw AS quality_raw
+                    q.model AS quality_model, q.raw AS quality_raw,
+                    cc.call_type, cc.reason AS classification_reason,
+                    cc.critical_errors, cc.confidence AS classification_confidence,
+                    cc.model AS classification_model, cc.raw AS classification_raw
                 FROM calls c
                 LEFT JOIN transcriptions t ON t.call_id = c.id
                 LEFT JOIN quality_scores q ON q.call_id = c.id
+                LEFT JOIN call_classifications cc ON cc.call_id = c.id
                 WHERE c.id = $1
                 """,
                 call_id,
@@ -251,20 +271,70 @@ class Repository:
                     duration_seconds,
                     _json(raw or {}),
                 )
-                await conn.execute("UPDATE calls SET status='transcribed', error=NULL WHERE id=$1", call_id)
+                await conn.execute(
+                    "UPDATE calls SET status='transcribed', error=NULL WHERE id=$1",
+                    call_id,
+                )
 
     async def transcription_exists(self, call_id: str) -> bool:
         async with self.pg.acquire() as conn:
-            value = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM transcriptions WHERE call_id=$1)", call_id)
+            value = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM transcriptions WHERE call_id=$1)", call_id
+            )
         return bool(value)
 
     async def get_transcription(self, call_id: str) -> str | None:
         async with self.pg.acquire() as conn:
-            return await conn.fetchval("SELECT transcript FROM transcriptions WHERE call_id=$1", call_id)
+            return await conn.fetchval(
+                "SELECT transcript FROM transcriptions WHERE call_id=$1", call_id
+            )
+
+    async def classification_exists(self, call_id: str) -> bool:
+        async with self.pg.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM call_classifications WHERE call_id=$1)",
+                call_id,
+            )
+        return bool(value)
+
+    async def save_classification(
+        self,
+        *,
+        call_id: str,
+        classification: CallClassification,
+        model: str,
+        raw: dict[str, Any] | None = None,
+    ) -> None:
+        async with self.pg.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO call_classifications (
+                        call_id, call_type, reason, critical_errors, confidence, raw, model
+                    ) VALUES ($1,$2,$3,$4::jsonb,$5,$6::jsonb,$7)
+                    ON CONFLICT (call_id) DO UPDATE SET
+                        call_type=EXCLUDED.call_type, reason=EXCLUDED.reason,
+                        critical_errors=EXCLUDED.critical_errors, confidence=EXCLUDED.confidence,
+                        raw=EXCLUDED.raw, model=EXCLUDED.model, created_at=now()
+                    """,
+                    call_id,
+                    classification.call_type,
+                    classification.reason,
+                    _json(classification.critical_errors),
+                    classification.confidence,
+                    _json(raw or classification.model_dump(mode="json")),
+                    model,
+                )
+                await conn.execute(
+                    "UPDATE calls SET status='classified', error=NULL WHERE id=$1",
+                    call_id,
+                )
 
     async def quality_exists(self, call_id: str) -> bool:
         async with self.pg.acquire() as conn:
-            value = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM quality_scores WHERE call_id=$1)", call_id)
+            value = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM quality_scores WHERE call_id=$1)", call_id
+            )
         return bool(value)
 
     async def save_quality(
@@ -300,7 +370,10 @@ class Repository:
                     _json(raw or quality.model_dump(mode="json")),
                     model,
                 )
-                await conn.execute("UPDATE calls SET status='analyzed', error=NULL WHERE id=$1", call_id)
+                await conn.execute(
+                    "UPDATE calls SET status='analyzed', error=NULL WHERE id=$1",
+                    call_id,
+                )
 
     async def notification_exists(
         self,
@@ -343,7 +416,9 @@ class Repository:
 
     async def get_state(self, name: str) -> dict[str, Any] | None:
         async with self.pg.acquire() as conn:
-            value = await conn.fetchval("SELECT value FROM worker_state WHERE name=$1", name)
+            value = await conn.fetchval(
+                "SELECT value FROM worker_state WHERE name=$1", name
+            )
         return dict(value) if value else None
 
     async def set_state(self, name: str, value: dict[str, Any]) -> None:

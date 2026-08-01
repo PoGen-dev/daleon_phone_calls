@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     openrouter_transcribe_pool_timeout_seconds: float = Field(default=30.0, ge=0.1)
 
     openai_transcript_role_model: str | None = "openai/gpt-4o-mini"
+    openai_classification_model: str = "openai/gpt-4o-mini"
     openai_quality_model: str = "openai/gpt-4o-mini"
     openai_quality_temperature: float = 0.0
 
@@ -49,6 +50,9 @@ class Settings(BaseSettings):
     mango_stats_request_endpoint: str = "stats/request"
     mango_stats_result_endpoint: str = "stats/result"
     mango_recording_download_endpoint: str = "queries/recording/post/"
+    mango_users_endpoint: str = "config/users/request"
+    mango_enrich_user_metadata: bool = False
+    mango_users_cache_ttl_seconds: int = Field(default=3600, ge=0)
     mango_poll_interval_seconds: int = 30
     mango_catchup_interval_seconds: float = Field(default=1.0, ge=0)
     mango_lookback_seconds: int = 300

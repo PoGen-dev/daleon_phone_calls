@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class CallRecord(BaseModel):
@@ -127,6 +127,34 @@ class ObjectionAnalysis(BaseModel):
 class NextStepAnalysis(BaseModel):
     status: Literal["agreed", "proposed", "absent", "unclear"]
     quote: str | None
+
+
+CallType = Literal[
+    "appointment",
+    "sales",
+    "delivery",
+    "consultation",
+    "completed_deal",
+    "critical",
+]
+
+
+class CallClassification(BaseModel):
+    call_type: CallType
+    reason: str
+    critical_errors: list[str] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"]
+
+    @field_validator("critical_errors", mode="after")
+    @classmethod
+    def normalize_critical_errors(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+    @model_validator(mode="after")
+    def validate_critical_details(self) -> "CallClassification":
+        if self.call_type == "critical" and not self.critical_errors:
+            raise ValueError("critical call must contain at least one critical error")
+        return self
 
 
 class QualityResult(BaseModel):

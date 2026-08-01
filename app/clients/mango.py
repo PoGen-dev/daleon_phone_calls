@@ -25,6 +25,17 @@ _AUDIO_CONTENT_TYPES = {
     "application/ogg",
 }
 
+_MANGO_USER_EXT_FIELDS = [
+    "general.user_id",
+    "general.sips",
+    "groups",
+    "general.access_role_id",
+    "telephony.dial_alg",
+    "telephony.line_id",
+    "telephony.trunk_number_id",
+    "general.mobile",
+    "general.login",
+]
 
 class MangoApiError(RuntimeError):
     pass
@@ -39,6 +50,8 @@ class MangoClient:
         self.tz = ZoneInfo(settings.mango_default_timezone)
         self._recording_download_lock = asyncio.Lock()
         self._last_recording_download_at = 0.0
+        self._users_cache: list[dict[str, Any]] = []
+        self._users_cache_at = 0.0
         transport = httpx.AsyncHTTPTransport(retries=3)
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, read=90.0),
@@ -119,6 +132,165 @@ class MangoClient:
         except json.JSONDecodeError:
             return text
 
+    async def fetch_users(self, extension: str | None = None) -> list[dict[str, Any]]:
+        cache_ttl = self.settings.mango_users_cache_ttl_seconds
+        if (
+            extension is None
+            and self._users_cache
+            and cache_ttl > 0
+            and time.monotonic() - self._users_cache_at < cache_ttl
+        ):
+            return self._users_cache
+        payload: dict[str, Any] = {"ext_fields": _MANGO_USER_EXT_FIELDS}
+        if extension:
+            payload["extension"] = str(extension)
+        result = await self.request(self.settings.mango_users_endpoint, payload)
+        users = self._extract_users(result)
+        if extension is None:
+            self._users_cache = users
+            self._users_cache_at = time.monotonic()
+        logger.info(
+            "Mango users received: extension=%s count=%s", extension, len(users)
+        )
+        return users
+
+    async def find_user(self, identifier: str) -> dict[str, Any] | None:
+        identifier = str(identifier).strip()
+        if not identifier:
+            raise ValueError("Mango user identifier is empty")
+        extension = identifier if identifier.isdigit() else None
+        users = await self.fetch_users(extension=extension)
+        return self.resolve_user(identifier, users)
+
+    @classmethod
+    def resolve_user(
+        cls, identifier_or_row: str | dict[str, Any], users: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        identifiers: set[str] = set()
+        if isinstance(identifier_or_row, dict):
+            for key in (
+                "from_extension",
+                "to_extension",
+                "from_number",
+                "to_number",
+                "line_number",
+            ):
+                normalized = cls._normalize_user_identifier(identifier_or_row.get(key))
+                if normalized:
+                    identifiers.add(normalized)
+        else:
+            normalized = cls._normalize_user_identifier(identifier_or_row)
+            if normalized:
+                identifiers.add(normalized)
+        if not identifiers:
+            return None
+        for user in users:
+            if identifiers.intersection(cls._user_identifiers(user)):
+                return user
+        return None
+
+    @staticmethod
+    def employee_summary(user: dict[str, Any]) -> dict[str, Any]:
+        general = user.get("general") or {}
+        telephony = user.get("telephony") or {}
+        if not isinstance(general, dict):
+            general = {}
+        if not isinstance(telephony, dict):
+            telephony = {}
+        numbers = telephony.get("numbers") or []
+        if isinstance(numbers, dict):
+            numbers = [numbers]
+        if not isinstance(numbers, list):
+            numbers = []
+        sip_numbers: list[str] = []
+        phone_numbers: list[str] = []
+        for item in numbers:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("number_normalized") or item.get("number") or "").strip()
+            if not value:
+                continue
+            if item.get("protocol") == "sip" or value.lower().startswith("sip:"):
+                sip_numbers.append(value)
+            elif item.get("protocol") == "tel":
+                phone_numbers.append(value)
+        return {
+            "extension": telephony.get("extension"),
+            "name": general.get("name"),
+            "user_id": general.get("user_id"),
+            "department": general.get("department"),
+            "position": general.get("position"),
+            "email": general.get("email"),
+            "mobile": general.get("mobile"),
+            "login": general.get("login"),
+            "outgoingline": telephony.get("outgoingline"),
+            "line_id": telephony.get("line_id"),
+            "sip_numbers": list(dict.fromkeys(sip_numbers)),
+            "phone_numbers": list(dict.fromkeys(phone_numbers)),
+            "groups": user.get("groups") or [],
+        }
+
+    @classmethod
+    def _user_identifiers(cls, user: dict[str, Any]) -> set[str]:
+        general = user.get("general") or {}
+        telephony = user.get("telephony") or {}
+        if not isinstance(general, dict):
+            general = {}
+        if not isinstance(telephony, dict):
+            telephony = {}
+        values: list[Any] = [
+            telephony.get("extension"),
+            telephony.get("outgoingline"),
+            general.get("login"),
+        ]
+        numbers = telephony.get("numbers") or []
+        if isinstance(numbers, dict):
+            numbers = [numbers]
+        if isinstance(numbers, list):
+            values.extend(
+                item.get("number")
+                for item in numbers
+                if isinstance(item, dict)
+            )
+        sips = general.get("sips") or []
+        if isinstance(sips, dict):
+            sips = [sips]
+        if isinstance(sips, list):
+            values.extend(
+                item.get("number") if isinstance(item, dict) else item for item in sips
+            )
+        return {
+            normalized
+            for value in values
+            if (normalized := cls._normalize_user_identifier(value))
+        }
+
+    @staticmethod
+    def _normalize_user_identifier(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if text.startswith("sip:"):
+            text = text[4:]
+        return text.rstrip(";")
+
+    @classmethod
+    def _extract_users(cls, value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, dict):
+            if "users" in value:
+                return cls._extract_users(value["users"])
+            if "result" in value:
+                nested = cls._extract_users(value["result"])
+                if nested:
+                    return nested
+            if "general" in value or "telephony" in value:
+                return [dict(value)]
+            users: list[dict[str, Any]] = []
+            for nested_value in value.values():
+                users.extend(cls._extract_users(nested_value))
+            return users
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, dict)]
+        return []
+
     async def fetch_calls(self, date_from: datetime, date_to: datetime) -> list[CallRecord]:
         fields = self.settings.mango_fields_list
         request_payload = {
@@ -169,6 +341,14 @@ class MangoClient:
             raise MangoApiError(f"Mango stats/result is not ready after polling: {result!r}")
 
         rows = self._parse_stats_result(result, fields)
+        users: list[dict[str, Any]] = []
+        if self.settings.mango_enrich_user_metadata:
+            try:
+                users = await self.fetch_users()
+            except Exception:
+                logger.exception(
+                    "Cannot enrich Mango calls with employee directory metadata"
+                )
         calls: list[CallRecord] = []
         for index, row in enumerate(rows, start=1):
             logger.info(
@@ -178,6 +358,17 @@ class MangoClient:
                 self._json_dumps(row),
             )
             call = self._row_to_call(row)
+            employee = self.resolve_user(row, users) if users else None
+            if employee:
+                call = call.model_copy(
+                    update={
+                        "raw": {
+                            **call.raw,
+                            "mango_employee": employee,
+                            "mango_employee_summary": self.employee_summary(employee),
+                        }
+                    }
+                )
             logger.info(
                 "Mango parsed call: report_id=%s index=%s call=%s",
                 report_id,
