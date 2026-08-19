@@ -212,9 +212,18 @@ async def test_transcriber_processes_audio_and_continues_idempotently(
         transcription_exists=AsyncMock(side_effect=[False, True]),
         classification_exists=AsyncMock(side_effect=[False, True]),
         get_transcription=AsyncMock(return_value="Клиент: готовый текст"),
+        get_call=AsyncMock(
+            return_value={
+                "direction": "incoming",
+                "from_number": "79990000000",
+                "to_number": "sip:user44@example.mangosip.ru",
+                "raw": {"to_extension": "44"},
+            }
+        ),
         save_transcription=AsyncMock(),
         save_classification=AsyncMock(),
     )
+    settings.transcription_preprocess_audio = False
     storage = SimpleNamespace(download=AsyncMock(return_value=b"audio"))
     ai = SimpleNamespace(
         transcribe=AsyncMock(return_value=("готовый текст", {"language": "ru"})),

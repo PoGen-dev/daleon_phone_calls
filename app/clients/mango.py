@@ -37,6 +37,7 @@ _MANGO_USER_EXT_FIELDS = [
     "general.login",
 ]
 
+
 class MangoApiError(RuntimeError):
     pass
 
@@ -52,6 +53,9 @@ class MangoClient:
         self._last_recording_download_at = 0.0
         self._users_cache: list[dict[str, Any]] = []
         self._users_cache_at = 0.0
+        self._users_extension_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._incoming_lines_cache: list[dict[str, Any]] = []
+        self._incoming_lines_cache_at = 0.0
         transport = httpx.AsyncHTTPTransport(retries=3)
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, read=90.0),
@@ -63,8 +67,12 @@ class MangoClient:
         await self.http.aclose()
 
     def sign(self, payload: dict[str, Any] | str) -> tuple[str, str]:
-        json_payload = payload if isinstance(payload, str) else self._json_dumps(payload)
-        digest = hashlib.sha256(f"{self.api_key}{json_payload}{self.api_salt}".encode("utf-8")).hexdigest()
+        json_payload = (
+            payload if isinstance(payload, str) else self._json_dumps(payload)
+        )
+        digest = hashlib.sha256(
+            f"{self.api_key}{json_payload}{self.api_salt}".encode("utf-8")
+        ).hexdigest()
         return json_payload, digest
 
     @staticmethod
@@ -84,7 +92,9 @@ class MangoClient:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
             if response.status_code == 429 and attempt < attempts:
-                delay = self._retry_after_seconds(response, fallback=self.settings.retry_backoff_seconds * attempt)
+                delay = self._retry_after_seconds(
+                    response, fallback=self.settings.retry_backoff_seconds * attempt
+                )
                 logger.warning(
                     "Mango API rate limited request: endpoint=%s attempt=%s/%s delay=%s",
                     endpoint,
@@ -113,7 +123,9 @@ class MangoClient:
         response = await self._post(endpoint, payload)
         return self._decode_response(response)
 
-    async def request_with_status(self, endpoint: str, payload: dict[str, Any]) -> tuple[int, Any]:
+    async def request_with_status(
+        self, endpoint: str, payload: dict[str, Any]
+    ) -> tuple[int, Any]:
         response = await self._post(endpoint, payload)
         return response.status_code, self._decode_response(response)
 
@@ -134,21 +146,30 @@ class MangoClient:
 
     async def fetch_users(self, extension: str | None = None) -> list[dict[str, Any]]:
         cache_ttl = self.settings.mango_users_cache_ttl_seconds
-        if (
-            extension is None
-            and self._users_cache
-            and cache_ttl > 0
-            and time.monotonic() - self._users_cache_at < cache_ttl
-        ):
-            return self._users_cache
+        now = time.monotonic()
+        if extension is None:
+            if (
+                self._users_cache
+                and cache_ttl > 0
+                and now - self._users_cache_at < cache_ttl
+            ):
+                return self._users_cache
+        else:
+            extension = str(extension)
+            cached = self._users_extension_cache.get(extension)
+            if cached and cache_ttl > 0 and now - cached[0] < cache_ttl:
+                return cached[1]
+
         payload: dict[str, Any] = {"ext_fields": _MANGO_USER_EXT_FIELDS}
         if extension:
-            payload["extension"] = str(extension)
+            payload["extension"] = extension
         result = await self.request(self.settings.mango_users_endpoint, payload)
         users = self._extract_users(result)
         if extension is None:
             self._users_cache = users
-            self._users_cache_at = time.monotonic()
+            self._users_cache_at = now
+        else:
+            self._users_extension_cache[extension] = (now, users)
         logger.info(
             "Mango users received: extension=%s count=%s", extension, len(users)
         )
@@ -161,6 +182,128 @@ class MangoClient:
         extension = identifier if identifier.isdigit() else None
         users = await self.fetch_users(extension=extension)
         return self.resolve_user(identifier, users)
+
+    async def fetch_incoming_lines(self) -> list[dict[str, Any]]:
+        cache_ttl = self.settings.mango_incoming_lines_cache_ttl_seconds
+        if (
+            self._incoming_lines_cache
+            and cache_ttl > 0
+            and time.monotonic() - self._incoming_lines_cache_at < cache_ttl
+        ):
+            return self._incoming_lines_cache
+        result = await self.request(self.settings.mango_incoming_lines_endpoint, {})
+        lines = self._extract_incoming_lines(result)
+        self._incoming_lines_cache = lines
+        self._incoming_lines_cache_at = time.monotonic()
+        logger.info("Mango incoming lines received: count=%s", len(lines))
+        return lines
+
+    async def resolve_employee_for_call(
+        self,
+        row: dict[str, Any],
+        *,
+        prefetched_users: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        if prefetched_users:
+            employee = self.resolve_user(row, prefetched_users)
+            if employee:
+                return employee
+
+        extension = self._employee_extension_for_row(row)
+        if extension:
+            users = await self.fetch_users(extension=extension)
+            employee = self.resolve_user(row, users) or self.resolve_user(
+                extension, users
+            )
+            if employee:
+                return employee
+
+        sip = self._first_sip_identifier(row)
+        if sip:
+            users = await self.fetch_users()
+            return self.resolve_user(sip, users)
+        return None
+
+    async def employee_service_phone_candidates(
+        self, employee: dict[str, Any]
+    ) -> list[str]:
+        summary = self.employee_summary(employee)
+        candidates: list[Any] = [
+            summary.get("outgoingline"),
+            *summary.get("phone_numbers", []),
+            summary.get("mobile"),
+        ]
+
+        line_id = summary.get("line_id")
+        if line_id not in (None, ""):
+            try:
+                lines = await self.fetch_incoming_lines()
+            except Exception:
+                logger.exception(
+                    "Cannot resolve Mango employee line_id=%s through incoming lines",
+                    line_id,
+                )
+            else:
+                line_id_text = str(line_id)
+                for line in lines:
+                    if str(line.get("line_id") or "") == line_id_text:
+                        candidates.append(line.get("number"))
+
+        result: list[str] = []
+        for value in candidates:
+            phone = self._normalize_public_phone(value)
+            if phone and phone not in result:
+                result.append(phone)
+        return result
+
+    @staticmethod
+    def _extract_incoming_lines(value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, dict):
+            lines = value.get("lines")
+            if isinstance(lines, dict):
+                return [dict(lines)]
+            if isinstance(lines, list):
+                return [dict(item) for item in lines if isinstance(item, dict)]
+            result = value.get("result")
+            if isinstance(result, dict):
+                return MangoClient._extract_incoming_lines(result)
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _normalize_public_phone(value: Any) -> str | None:
+        text = str(value or "").strip().lower()
+        if not text or text.startswith("sip:") or "@" in text or "mangosip" in text:
+            return None
+        digits = re.sub(r"\D+", "", text)
+        if len(digits) == 10 and digits.startswith("9"):
+            digits = f"7{digits}"
+        elif len(digits) == 11 and digits.startswith("8"):
+            digits = f"7{digits[1:]}"
+        if len(digits) != 11 or not digits.startswith("7"):
+            return None
+        return digits
+
+    @classmethod
+    def _first_sip_identifier(cls, row: dict[str, Any]) -> str | None:
+        for key in ("to_number", "from_number", "line_number"):
+            value = str(row.get(key) or "").strip()
+            if value.lower().startswith("sip:") or "mangosip" in value.lower():
+                return value
+        return None
+
+    @staticmethod
+    def _employee_extension_for_row(row: dict[str, Any]) -> str | None:
+        direction = str(row.get("direction") or row.get("call_direction") or "").lower()
+        if direction == "outgoing":
+            value = row.get("from_extension")
+        elif direction == "incoming":
+            value = row.get("to_extension")
+        else:
+            value = row.get("to_extension") or row.get("from_extension")
+        text = str(value or "").strip()
+        return text or None
 
     @classmethod
     def resolve_user(
@@ -207,7 +350,9 @@ class MangoClient:
         for item in numbers:
             if not isinstance(item, dict):
                 continue
-            value = str(item.get("number_normalized") or item.get("number") or "").strip()
+            value = str(
+                item.get("number_normalized") or item.get("number") or ""
+            ).strip()
             if not value:
                 continue
             if item.get("protocol") == "sip" or value.lower().startswith("sip:"):
@@ -248,9 +393,7 @@ class MangoClient:
             numbers = [numbers]
         if isinstance(numbers, list):
             values.extend(
-                item.get("number")
-                for item in numbers
-                if isinstance(item, dict)
+                item.get("number") for item in numbers if isinstance(item, dict)
             )
         sips = general.get("sips") or []
         if isinstance(sips, dict):
@@ -291,7 +434,9 @@ class MangoClient:
             return [dict(item) for item in value if isinstance(item, dict)]
         return []
 
-    async def fetch_calls(self, date_from: datetime, date_to: datetime) -> list[CallRecord]:
+    async def fetch_calls(
+        self, date_from: datetime, date_to: datetime
+    ) -> list[CallRecord]:
         fields = self.settings.mango_fields_list
         request_payload = {
             "date_from": str(int(date_from.timestamp())),
@@ -300,14 +445,18 @@ class MangoClient:
             "to": {"extension": "", "number": ""},
             "fields": ",".join(fields),
         }
-        initial = await self.request(self.settings.mango_stats_request_endpoint, request_payload)
+        initial = await self.request(
+            self.settings.mango_stats_request_endpoint, request_payload
+        )
         key = self._extract_key(initial)
         if not key:
             raise MangoApiError(f"Mango stats/request did not return key: {initial!r}")
 
         result_payload = self._stats_result_payload(initial, key)
         report_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
-        response_fields = sorted(initial) if isinstance(initial, dict) else [type(initial).__name__]
+        response_fields = (
+            sorted(initial) if isinstance(initial, dict) else [type(initial).__name__]
+        )
         logger.info(
             "Mango stats report accepted: report_id=%s date_from=%s date_to=%s fields=%s response_fields=%s",
             report_id,
@@ -338,7 +487,9 @@ class MangoClient:
             if attempt < self.settings.mango_result_poll_attempts:
                 await asyncio.sleep(self.settings.mango_result_poll_interval_seconds)
         else:
-            raise MangoApiError(f"Mango stats/result is not ready after polling: {result!r}")
+            raise MangoApiError(
+                f"Mango stats/result is not ready after polling: {result!r}"
+            )
 
         rows = self._parse_stats_result(result, fields)
         users: list[dict[str, Any]] = []
@@ -358,16 +509,53 @@ class MangoClient:
                 self._json_dumps(row),
             )
             call = self._row_to_call(row)
-            employee = self.resolve_user(row, users) if users else None
+            employee: dict[str, Any] | None = None
+            should_resolve_sip = (
+                self.settings.mango_resolve_sip_service_number
+                and self._first_sip_identifier(row) is not None
+            )
+            if users or should_resolve_sip:
+                try:
+                    employee = await self.resolve_employee_for_call(
+                        row, prefetched_users=users
+                    )
+                except Exception:
+                    logger.exception(
+                        "Cannot resolve Mango employee for call: report_id=%s index=%s",
+                        report_id,
+                        index,
+                    )
+
             if employee:
-                call = call.model_copy(
-                    update={
-                        "raw": {
-                            **call.raw,
-                            "mango_employee": employee,
-                            "mango_employee_summary": self.employee_summary(employee),
-                        }
-                    }
+                summary = self.employee_summary(employee)
+                service_numbers: list[str] = []
+                if should_resolve_sip:
+                    service_numbers = await self.employee_service_phone_candidates(
+                        employee
+                    )
+                raw_update: dict[str, Any] = {
+                    **call.raw,
+                    "mango_employee_summary": summary,
+                    "mango_employee_phone_candidates": list(
+                        dict.fromkeys(
+                            [
+                                *summary.get("phone_numbers", []),
+                                *summary.get("sip_numbers", []),
+                                str(summary.get("outgoingline") or ""),
+                                str(summary.get("mobile") or ""),
+                            ]
+                        )
+                    ),
+                    "mango_employee_service_phone_candidates": service_numbers,
+                }
+                if self.settings.mango_enrich_user_metadata:
+                    raw_update["mango_employee"] = employee
+                call = call.model_copy(update={"raw": raw_update})
+                logger.info(
+                    "Mango SIP employee resolved: extension=%s line_id=%s service_numbers=%s",
+                    summary.get("extension"),
+                    summary.get("line_id"),
+                    service_numbers,
                 )
             logger.info(
                 "Mango parsed call: report_id=%s index=%s call=%s",
@@ -391,7 +579,9 @@ class MangoClient:
     def _extract_key(self, value: Any) -> str | None:
         if isinstance(value, dict):
             nested = value.get("result")
-            return value.get("key") or (nested.get("key") if isinstance(nested, dict) else None)
+            return value.get("key") or (
+                nested.get("key") if isinstance(nested, dict) else None
+            )
         return getattr(value, "key", None)
 
     def _is_result_ready(self, value: Any) -> bool:
@@ -409,7 +599,9 @@ class MangoClient:
             return bool(value.strip())
         return True
 
-    def _parse_stats_result(self, result: Any, fields: list[str]) -> list[dict[str, Any]]:
+    def _parse_stats_result(
+        self, result: Any, fields: list[str]
+    ) -> list[dict[str, Any]]:
         if isinstance(result, dict):
             payload = result
             for key in ("data", "result", "rows"):
@@ -436,7 +628,10 @@ class MangoClient:
             cleaned = [value.strip().strip("[]") for value in values]
             if cleaned == fields:
                 continue
-            row = {field: cleaned[idx] if idx < len(cleaned) else None for idx, field in enumerate(fields)}
+            row = {
+                field: cleaned[idx] if idx < len(cleaned) else None
+                for idx, field in enumerate(fields)
+            }
             rows.append(row)
         return rows
 
@@ -446,9 +641,15 @@ class MangoClient:
         call_id = self._first(row, "call_id", "id")
         recording_id = self._extract_recording_id(row)
         recording_url = self._extract_recording_url(row)
-        started_at = self._parse_mango_datetime(self._first(row, "start", "create_time", "started_at"))
-        finished_at = self._parse_mango_datetime(self._first(row, "finish", "end_time", "finished_at"))
-        generated_id = call_id or entry_id or recording_id or self._stable_fallback_id(row)
+        started_at = self._parse_mango_datetime(
+            self._first(row, "start", "create_time", "started_at")
+        )
+        finished_at = self._parse_mango_datetime(
+            self._first(row, "finish", "end_time", "finished_at")
+        )
+        generated_id = (
+            call_id or entry_id or recording_id or self._stable_fallback_id(row)
+        )
         direction = self._first(row, "call_direction", "direction")
         if not direction:
             if self._first(row, "from_extension"):
@@ -514,29 +715,43 @@ class MangoClient:
                 parsed = parsed.replace(tzinfo=self.tz)
             return parsed.astimezone(timezone.utc)
         except (ValueError, OverflowError) as exc:
-            logger.warning("Cannot parse Mango datetime", extra={"value": value, "error": str(exc)})
+            logger.warning(
+                "Cannot parse Mango datetime", extra={"value": value, "error": str(exc)}
+            )
             return None
 
     @staticmethod
     def _stable_fallback_id(row: dict[str, Any]) -> str:
-        digest = hashlib.sha256(json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(
+            json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
         return digest[:32]
 
-    async def download_recording(self, *, recording_url: str | None, recording_id: str | None) -> tuple[bytes, str]:
+    async def download_recording(
+        self, *, recording_url: str | None, recording_id: str | None
+    ) -> tuple[bytes, str]:
         if recording_url:
             await self._wait_recording_download_slot()
             response = await self.http.get(recording_url)
             response.raise_for_status()
-            filename = self._filename_from_response(response, fallback=f"{recording_id or 'recording'}.mp3")
+            filename = self._filename_from_response(
+                response, fallback=f"{recording_id or 'recording'}.mp3"
+            )
             return self._audio_content(response), filename
 
         if not recording_id:
             raise MangoApiError("No recording_url or recording_id supplied")
-        endpoint = self.settings.mango_recording_download_endpoint.format(recording_id=recording_id)
+        endpoint = self.settings.mango_recording_download_endpoint.format(
+            recording_id=recording_id
+        )
         await self._wait_recording_download_slot()
-        response = await self._post(endpoint, {"recording_id": recording_id, "action": "download"})
+        response = await self._post(
+            endpoint, {"recording_id": recording_id, "action": "download"}
+        )
         try:
-            filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
+            filename = self._filename_from_response(
+                response, fallback=f"{recording_id}.mp3"
+            )
             return self._audio_content(response), filename
         except MangoApiError:
             result = self._decode_response(response)
@@ -544,17 +759,27 @@ class MangoClient:
             await self._wait_recording_download_slot()
             response = await self.http.get(result)
             response.raise_for_status()
-            filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
+            filename = self._filename_from_response(
+                response, fallback=f"{recording_id}.mp3"
+            )
             return self._audio_content(response), filename
         if isinstance(result, dict):
-            url = result.get("recording_url") or result.get("url") or result.get("download_url")
+            url = (
+                result.get("recording_url")
+                or result.get("url")
+                or result.get("download_url")
+            )
             if url:
                 await self._wait_recording_download_slot()
                 response = await self.http.get(str(url))
                 response.raise_for_status()
-                filename = self._filename_from_response(response, fallback=f"{recording_id}.mp3")
+                filename = self._filename_from_response(
+                    response, fallback=f"{recording_id}.mp3"
+                )
                 return self._audio_content(response), filename
-        raise MangoApiError(f"Cannot resolve Mango recording download URL for {recording_id}: {result!r}")
+        raise MangoApiError(
+            f"Cannot resolve Mango recording download URL for {recording_id}: {result!r}"
+        )
 
     async def _wait_recording_download_slot(self) -> None:
         interval = self.settings.mango_recording_download_interval_seconds
@@ -573,22 +798,38 @@ class MangoClient:
         if not content:
             raise MangoApiError("Mango recording response is empty")
 
-        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        content_type = (
+            response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        )
         prefix = content[:64].lstrip().lower()
-        if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
-            raise MangoApiError(f"Mango recording returned non-audio Content-Type: {content_type}")
+        if content_type.startswith("text/") or content_type in {
+            "application/json",
+            "application/xml",
+        }:
+            raise MangoApiError(
+                f"Mango recording returned non-audio Content-Type: {content_type}"
+            )
         if prefix.startswith((b"<!doctype", b"<html", b"<?xml", b"{")):
             raise MangoApiError("Mango recording returned a document instead of audio")
 
         has_audio_signature = (
             content.startswith((b"ID3", b"OggS", b"fLaC", b"\x1aE\xdf\xa3"))
-            or (len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WAVE")
+            or (
+                len(content) >= 12
+                and content.startswith(b"RIFF")
+                and content[8:12] == b"WAVE"
+            )
             or (len(content) >= 8 and content[4:8] == b"ftyp")
             or (len(content) >= 2 and content[0] == 0xFF and content[1] & 0xE0 == 0xE0)
         )
-        declared_audio = content_type.startswith(("audio/", "video/")) or content_type in _AUDIO_CONTENT_TYPES
+        declared_audio = (
+            content_type.startswith(("audio/", "video/"))
+            or content_type in _AUDIO_CONTENT_TYPES
+        )
         if not declared_audio and not has_audio_signature:
-            raise MangoApiError(f"Mango recording has unsupported Content-Type: {content_type or 'missing'}")
+            raise MangoApiError(
+                f"Mango recording has unsupported Content-Type: {content_type or 'missing'}"
+            )
         return content
 
     @staticmethod

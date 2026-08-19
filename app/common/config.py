@@ -34,12 +34,16 @@ class Settings(BaseSettings):
     openrouter_app_name: str = "Mango Transcribe Analysis"
     openai_transcribe_model: str = "openai/gpt-4o-transcribe"
     openai_transcribe_language: str | None = "ru"
+    openrouter_transcribe_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+    transcription_preprocess_audio: bool = True
+    transcription_ffmpeg_timeout_seconds: float = Field(default=90.0, ge=1.0)
     openrouter_transcribe_connect_timeout_seconds: float = Field(default=30.0, ge=0.1)
     openrouter_transcribe_write_timeout_seconds: float = Field(default=120.0, ge=0.1)
     openrouter_transcribe_read_timeout_seconds: float = Field(default=900.0, ge=1.0)
     openrouter_transcribe_pool_timeout_seconds: float = Field(default=30.0, ge=0.1)
 
     openai_transcript_role_model: str | None = "openai/gpt-4o-mini"
+    openai_transcript_role_review_model: str | None = "openai/gpt-4o"
     openai_classification_model: str = "openai/gpt-4o-mini"
     openai_quality_model: str = "openai/gpt-4o-mini"
     openai_quality_temperature: float = 0.0
@@ -51,8 +55,11 @@ class Settings(BaseSettings):
     mango_stats_result_endpoint: str = "stats/result"
     mango_recording_download_endpoint: str = "queries/recording/post/"
     mango_users_endpoint: str = "config/users/request"
+    mango_incoming_lines_endpoint: str = "incominglines"
+    mango_resolve_sip_service_number: bool = True
     mango_enrich_user_metadata: bool = False
     mango_users_cache_ttl_seconds: int = Field(default=3600, ge=0)
+    mango_incoming_lines_cache_ttl_seconds: int = Field(default=3600, ge=0)
     mango_poll_interval_seconds: int = 30
     mango_catchup_interval_seconds: float = Field(default=1.0, ge=0)
     mango_lookback_seconds: int = 300

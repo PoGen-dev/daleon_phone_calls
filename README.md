@@ -23,7 +23,8 @@ cp .env.example .env
 # MINIO_PUBLIC_BASE_URL должен быть адресом MinIO, открываемым из Telegram
 # OPENROUTER_TRANSCRIBE_READ_TIMEOUT_SECONDS задаёт ожидание ответа STT, по умолчанию 900 секунд
 # OPENAI_CLASSIFICATION_MODEL задаёт модель отдельного этапа классификации
-# MANGO_ENRICH_USER_METADATA=true включает привязку SIP/добавочного к справочнику сотрудников Mango
+# MANGO_RESOLVE_SIP_SERVICE_NUMBER=true автоматически связывает SIP/добавочный с номером линии автосервиса
+# MANGO_ENRICH_USER_METADATA=true дополнительно сохраняет полную карточку сотрудника Mango
 docker compose up --build -d
 docker compose ps
 ```
@@ -58,9 +59,20 @@ docker compose ps
 повторно отправится только отсутствующий TXT-файл.
 
 
-## OpenRouter transcription timeout
+## Качество транскрибации и OpenRouter timeout
 
-Перед отправкой аудио `transcriber-worker` пишет в лог модель, имя файла, формат, размер удио и текущие timeout-настройки.
+По умолчанию `transcriber-worker` перед STT нормализует запись через `ffmpeg`: mono PCM WAV 16 kHz, речевой фильтр
+70-7600 Hz и loudness normalization. Если `ffmpeg` недоступен или не смог обработать конкретную запись, worker
+не теряет звонок и автоматически отправляет в STT исходный аудиофайл.
+
+Настройки:
+
+- `TRANSCRIPTION_PREPROCESS_AUDIO=true` — включить предобработку.
+- `TRANSCRIPTION_FFMPEG_TIMEOUT_SECONDS=90` — максимальное время локальной нормализации.
+- `OPENROUTER_TRANSCRIBE_TEMPERATURE=0` — детерминированная STT-декодировка.
+- `OPENAI_TRANSCRIBE_LANGUAGE=ru` — явный язык распознавания.
+
+Перед отправкой аудио `transcriber-worker` пишет в лог модель, имя файла, формат, размер аудио и текущие timeout-настройки.
 Для длинных записей или медленного proxy увеличивайте:
 
 - `OPENROUTER_TRANSCRIBE_CONNECT_TIMEOUT_SECONDS=30` — ожидание подключения.
@@ -96,8 +108,16 @@ docker compose ps
 ## Контроль качества ИИ
 
 После STT модель делит текст на реплики `Менеджер`, `Клиент` и `Спикер не определён`. Это семантическая атрибуция,
-а не акустическая diarization: код разрешает только пунктуацию и границы реплик, затем проверяет полное совпадение слов
-с исходным текстом. При любом добавлении, удалении или перестановке слов сохраняется исходный текст с неизвестной ролью.
+а не акустическая diarization. В первый запрос дополнительно передаются метаданные звонка (`incoming/outgoing`, внешний
+номер, внутренний extension, найденное имя сотрудника), но модель не имеет права переносить эти сведения в текст.
+Код разрешает только пунктуацию, границы реплик и роли, затем проверяет полное совпадение всех исходных слов и их порядка.
+
+Если первичная разметка подозрительна — содержит `unknown`, длинный диалог размечен одним участником или почти не
+разбит на реплики — выполняется второй review-запрос через `OPENAI_TRANSCRIPT_ROLE_REVIEW_MODEL` (по умолчанию
+`openai/gpt-4o`). Более дорогая модель используется только для сомнительных случаев. Если review изменил исходные слова,
+он отбрасывается; валидная первичная разметка сохраняется. Если обе попытки нарушили lossless-проверку, сохраняется
+исходный STT-текст с ролью `Спикер не определён`.
+ 
 
 После разделения спикеров выполняется отдельный запрос классификации. Возможные типы: `Запись`, `Продажи`,
 `Доставка`, `Консультация`, `Готовая сделка`, `Критическая`. `Консультация` используется как fallback. Для
@@ -123,15 +143,32 @@ docker compose run --rm mango-worker python scripts/lookup_mango_user.py "sip:us
 ```
 
 Команда выводит ФИО, `user_id`, отдел, должность, мобильный, исходящую линию, `line_id`, SIP-учётки, телефонные
-номера и группы. Для автоматического добавления этих данных в `calls.raw.mango_employee` включите:
+номера и группы. Для определения автосервиса полное enrichment включать не требуется. По умолчанию:
 
 ```env
 MANGO_ENRICH_USER_METADATA=true
+MANGO_RESOLVE_SIP_SERVICE_NUMBER=true
+MANGO_USERS_ENDPOINT=config/users/request
+MANGO_INCOMING_LINES_ENDPOINT=incominglines
 MANGO_USERS_CACHE_TTL_SECONDS=3600
+MANGO_INCOMING_LINES_CACHE_TTL_SECONDS=3600
 ```
 
-Справочник сотрудников кэшируется, поэтому штатный polling звонков не создаёт запрос к API конфигурации каждые
-30 секунд. Если enrichment временно недоступен, загрузка звонков продолжается без него.
+Если номер звонка имеет вид `sip:user44@...mangosip.ru`, worker сначала ищет сотрудника по `to_extension` /
+`from_extension` или SIP, затем использует его `telephony.line_id`, получает список `/vpbx/incominglines` и связывает
+`line_id` с реальным номером ВАТС. Найденные номера сохраняются в
+`calls.raw.mango_employee_service_phone_candidates` и участвуют в `SERVICE_BY_PHONE` раньше исходного `to_number`.
+Цифры из SIP-домена (`vpbx400100296...`) больше не считаются телефонным номером.
+
+Для автоматического сохранения полной карточки сотрудника дополнительно включите:
+
+```env
+MANGO_ENRICH_USER_METADATA=true
+```
+
+Справочник сотрудников и входящих линий кэшируется. Если enrichment или line lookup временно недоступен, загрузка
+звонков продолжается; просто конкретный звонок может остаться без определённого автосервиса до следующего нового события.
+Скрипт `scripts/lookup_mango_user.py` теперь также выводит `service_phone_candidates`.
 
 ## Проверка
 
@@ -188,15 +225,17 @@ docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations
 
 
 ## VPN/proxy container
-
-Проект поддерживает локальный proxy-сервис `mihomo` внутри Docker Compose. Он нужен, чтобы направить OpenRouter и Telegram через VPN/proxy, не меняя код воркеров.
+Проект поддерживает локальный proxy-сервис `mihomo` внутри Docker Compose. OpenRouter и Telegram можно направить
+через несколько VPN-узлов разных стран с автоматическим failover. В `config.example.yaml` используются две независимые
+`fallback`-группы: `OPENROUTER_AUTO` и `TELEGRAM_AUTO`. Это позволяет, например, оставить Telegram на стране A, но
+автоматически перевести OpenRouter на страну B, если страна A перестала открывать только OpenRouter.
 
 1. Создайте runtime-конфиг, который не коммитится в Git:
 
 ```bash
 mkdir -p infra/mihomo
 cp infra/mihomo/config.example.yaml infra/mihomo/config.yaml
-# перенесите proxies/proxy-groups из вашего Clash/Mihomo YAML в infra/mihomo/config.yaml
+# замените COUNTRY_A/COUNTRY_B на реальные узлы разных стран, сохранив fallback-группы
 ```
 
 Для доступа из других контейнеров в конфиге должны быть значения:
@@ -222,6 +261,11 @@ NO_PROXY=localhost,127.0.0.1,postgres,kafka,zookeeper,minio,api,mihomo
 
 ```bash
 docker compose up -d --build --force-recreate mihomo transcriber-worker quality-worker telegram-worker
+```
+Проверка текущего выбранного узла каждой fallback-группы:
+
+```bash
+python scripts/check_vpn_failover.py
 ```
 
 Проверка логов proxy:

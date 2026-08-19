@@ -239,6 +239,7 @@ async def test_openrouter_client_transcribes_and_scores(
         "model": "openai/gpt-4o-transcribe",
         "input_audio": {"data": "YXVkaW8=", "format": "mp3"},
         "language": "ru",
+        "temperature": 0.0,
     }
     assert QUALITY_JSON_SCHEMA["schema"]["additionalProperties"] is False
     await ai.aclose()
@@ -679,3 +680,119 @@ async def test_postgres_connection_decodes_json() -> None:
     ]
     decoder = conn.set_type_codec.await_args.kwargs["decoder"]
     assert decoder('{"cursor":"now"}') == {"cursor": "now"}
+
+
+@pytest.mark.asyncio
+async def test_transcript_roles_review_suspicious_unknown_with_call_context(
+    settings, monkeypatch
+) -> None:
+    first_content = (
+        '{"turns":[{"speaker":"unknown","text":"Здравствуйте"},'
+        '{"speaker":"client","text":"Хочу записаться"}]}'
+    )
+    review_content = (
+        '{"turns":[{"speaker":"manager","text":"Здравствуйте"},'
+        '{"speaker":"client","text":"Хочу записаться"}]}'
+    )
+    first = Dumpable({"choices": []})
+    first.choices = [SimpleNamespace(message=SimpleNamespace(content=first_content))]
+    review = Dumpable({"choices": []})
+    review.choices = [SimpleNamespace(message=SimpleNamespace(content=review_content))]
+    create = AsyncMock(side_effect=[first, review])
+    fake = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=AsyncMock(),
+    )
+    stt_http = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr(
+        "app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake)
+    )
+    monkeypatch.setattr(
+        "app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http)
+    )
+    ai = OpenAIQaClient(settings)
+
+    transcript, raw = await ai.structure_transcript(
+        "Здравствуйте. Хочу записаться.",
+        context={
+            "direction": "incoming",
+            "client_number": "79052209632",
+            "employee_extension": "44",
+        },
+    )
+
+    assert transcript == "Менеджер: Здравствуйте\nКлиент: Хочу записаться"
+    assert raw["validated"] is True and raw["reviewed"] is True
+    assert raw["model"] == settings.openai_transcript_role_review_model
+    assert create.await_count == 2
+    first_prompt = create.await_args_list[0].kwargs["messages"][1]["content"]
+    assert "employee_extension: 44" in first_prompt
+    assert "client_number: 79052209632" in first_prompt
+    await ai.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transcript_role_review_does_not_replace_valid_lossless_first_pass(
+    settings, monkeypatch
+) -> None:
+    valid = (
+        '{"turns":[{"speaker":"manager","text":"Здравствуйте"},'
+        '{"speaker":"client","text":"Мне дорого"}]}'
+    )
+    invented = (
+        '{"turns":[{"speaker":"manager","text":"Здравствуйте клиент"},'
+        '{"speaker":"client","text":"Мне дорого"}]}'
+    )
+    first = Dumpable({"choices": []})
+    first.choices = [SimpleNamespace(message=SimpleNamespace(content=valid))]
+    bad_review = Dumpable({"choices": []})
+    bad_review.choices = [SimpleNamespace(message=SimpleNamespace(content=invented))]
+    create = AsyncMock(side_effect=[first, bad_review])
+    fake = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=AsyncMock(),
+    )
+    stt_http = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr(
+        "app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake)
+    )
+    monkeypatch.setattr(
+        "app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http)
+    )
+    ai = OpenAIQaClient(settings)
+
+    transcript, raw = await ai.structure_transcript("Здравствуйте. Мне дорого.")
+
+    assert transcript == "Менеджер: Здравствуйте\nКлиент: Мне дорого"
+    assert raw["reviewed"] is False
+    assert create.await_count == 1
+    await ai.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transcript_role_validation_rejects_word_split_or_merge(
+    settings, monkeypatch
+) -> None:
+    content = '{"turns":[{"speaker":"manager","text":"авто сервис"}]}'
+    completion = Dumpable({"choices": []})
+    completion.choices = [SimpleNamespace(message=SimpleNamespace(content=content))]
+    fake = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(return_value=completion))
+        ),
+        close=AsyncMock(),
+    )
+    stt_http = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr(
+        "app.clients.openai_qa.AsyncOpenAI", MagicMock(return_value=fake)
+    )
+    monkeypatch.setattr(
+        "app.clients.openai_qa.httpx.AsyncClient", MagicMock(return_value=stt_http)
+    )
+    ai = OpenAIQaClient(settings)
+
+    transcript, raw = await ai.structure_transcript("автосервис")
+
+    assert transcript == "Спикер не определён: автосервис"
+    assert raw["validated"] is False
+    await ai.aclose()

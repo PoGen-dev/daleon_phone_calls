@@ -19,8 +19,10 @@ from app.prompts.classification import (
 )
 from app.prompts.quality import QUALITY_SYSTEM_PROMPT, build_quality_user_prompt
 from app.prompts.transcription import (
+    TRANSCRIPT_ROLE_REVIEW_SYSTEM_PROMPT,
     TRANSCRIPT_ROLE_SYSTEM_PROMPT,
     build_transcript_role_prompt,
+    build_transcript_role_review_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -291,7 +293,9 @@ class OpenAIQaClient:
         )
         self.transcribe_model = settings.openai_transcribe_model
         self.transcribe_language = settings.openai_transcribe_language
+        self.transcribe_temperature = settings.openrouter_transcribe_temperature
         self.transcript_role_model = settings.openai_transcript_role_model
+        self.transcript_role_review_model = settings.openai_transcript_role_review_model
         self.classification_model = settings.openai_classification_model
         self.quality_model = settings.openai_quality_model
         self.quality_temperature = settings.openai_quality_temperature
@@ -326,6 +330,7 @@ class OpenAIQaClient:
         }
         if self.transcribe_language:
             payload["language"] = self.transcribe_language
+        payload["temperature"] = self.transcribe_temperature
         response = await self.stt_http.post(self.transcription_url, json=payload)
         status_code = getattr(response, "status_code", None)
         if status_code is not None and status_code >= 400:
@@ -374,18 +379,97 @@ class OpenAIQaClient:
             f"Cannot determine supported audio format from filename: {filename!r}"
         )
 
-    async def structure_transcript(self, transcript: str) -> tuple[str, dict[str, Any]]:
+    async def structure_transcript(
+        self,
+        transcript: str,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         if not self.transcript_role_model:
             return f"{SPEAKER_LABELS['unknown']}: {transcript.strip()}", {
                 "enabled": False,
                 "validated": True,
             }
-        completion = await self.client.chat.completions.create(
+
+        first = await self._request_role_structuring(
             model=self.transcript_role_model,
+            system_prompt=TRANSCRIPT_ROLE_SYSTEM_PROMPT,
+            user_prompt=build_transcript_role_prompt(transcript, context),
+        )
+        first_result = self._validate_role_structuring(transcript, first)
+
+        review_reason = self._role_review_reason(
+            transcript,
+            first_result.get("turns") if first_result.get("validated") else None,
+        )
+        if not review_reason and first_result.get("validated"):
+            return str(first_result["transcript"]), {
+                "enabled": True,
+                "validated": True,
+                "reviewed": False,
+                "model": self.transcript_role_model,
+                "turns": first_result["turns"],
+                "response": first["response"],
+            }
+
+        if self.transcript_role_review_model:
+            review = await self._request_role_structuring(
+                model=self.transcript_role_review_model,
+                system_prompt=TRANSCRIPT_ROLE_REVIEW_SYSTEM_PROMPT,
+                user_prompt=build_transcript_role_review_prompt(
+                    transcript,
+                    first_result.get("turns"),
+                    context,
+                ),
+            )
+            review_result = self._validate_role_structuring(transcript, review)
+            if review_result.get("validated"):
+                return str(review_result["transcript"]), {
+                    "enabled": True,
+                    "validated": True,
+                    "reviewed": True,
+                    "review_reason": review_reason or first_result.get("error"),
+                    "model": self.transcript_role_review_model,
+                    "initial_model": self.transcript_role_model,
+                    "turns": review_result["turns"],
+                    "initial_turns": first_result.get("turns"),
+                    "response": review["response"],
+                    "initial_response": first["response"],
+                }
+
+        if first_result.get("validated"):
+            return str(first_result["transcript"]), {
+                "enabled": True,
+                "validated": True,
+                "reviewed": bool(self.transcript_role_review_model),
+                "review_reason": review_reason,
+                "model": self.transcript_role_model,
+                "turns": first_result["turns"],
+                "response": first["response"],
+            }
+
+        return f"{SPEAKER_LABELS['unknown']}: {transcript.strip()}", {
+            "enabled": True,
+            "validated": False,
+            "reviewed": bool(self.transcript_role_review_model),
+            "model": self.transcript_role_model,
+            "error": first_result.get("error") or "speaker structuring failed",
+            "response": first["response"],
+        }
+
+    async def _request_role_structuring(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
+        completion = await self.client.chat.completions.create(
+            model=model,
             temperature=0,
             messages=[
-                {"role": "system", "content": TRANSCRIPT_ROLE_SYSTEM_PROMPT},
-                {"role": "user", "content": build_transcript_role_prompt(transcript)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             response_format={
                 "type": "json_schema",
@@ -398,41 +482,62 @@ class OpenAIQaClient:
             if hasattr(completion, "model_dump")
             else {"content": content}
         )
+        return {"content": content, "response": response_raw}
+
+    def _validate_role_structuring(
+        self, transcript: str, result: dict[str, Any]
+    ) -> dict[str, Any]:
         try:
-            payload = json.loads(content)
+            payload = json.loads(str(result.get("content") or "{}"))
             turns = payload.get("turns")
             if not isinstance(turns, list) or not turns:
                 raise ValueError("speaker turn list is empty")
             texts: list[str] = []
             lines: list[str] = []
+            normalized_turns: list[dict[str, str]] = []
             for turn in turns:
+                if not isinstance(turn, dict):
+                    raise ValueError("speaker turn is not an object")
                 speaker = turn.get("speaker")
                 text = str(turn.get("text") or "").strip()
                 if speaker not in SPEAKER_LABELS or not text:
                     raise ValueError("speaker turn has invalid speaker or empty text")
                 texts.append(text)
-                lines.append(f"{SPEAKER_LABELS[speaker]}: {text}")
-            if self._normalized_content(" ".join(texts)) != self._normalized_content(
-                transcript
-            ):
+                normalized_turns.append({"speaker": str(speaker), "text": text})
+                lines.append(f"{SPEAKER_LABELS[str(speaker)]}: {text}")
+
+            if self._normalized_word_sequence(
+                " ".join(texts)
+            ) != self._normalized_word_sequence(transcript):
                 raise ValueError(
                     "speaker structuring changed transcript words or their order"
                 )
-            return "\n".join(lines), {
-                "enabled": True,
+            return {
                 "validated": True,
-                "model": self.transcript_role_model,
-                "turns": turns,
-                "response": response_raw,
+                "transcript": "\n".join(lines),
+                "turns": normalized_turns,
             }
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            return f"{SPEAKER_LABELS['unknown']}: {transcript.strip()}", {
-                "enabled": True,
-                "validated": False,
-                "model": self.transcript_role_model,
-                "error": str(exc),
-                "response": response_raw,
-            }
+            return {"validated": False, "error": str(exc), "turns": None}
+
+    @staticmethod
+    def _role_review_reason(
+        transcript: str, turns: list[dict[str, Any]] | None
+    ) -> str | None:
+        if not turns:
+            return "initial role structuring is invalid"
+
+        speakers = [str(turn.get("speaker")) for turn in turns]
+        if "unknown" in speakers:
+            return "initial role structuring contains unknown speaker"
+
+        word_count = len(re.findall(r"\w+", transcript, flags=re.UNICODE))
+        known = {speaker for speaker in speakers if speaker in {"manager", "client"}}
+        if word_count >= 30 and len(known) < 2:
+            return "long dialogue has only one known speaker"
+        if word_count >= 80 and len(turns) <= 2:
+            return "long dialogue has too few turns"
+        return None
 
     async def classify_call(
         self, *, transcript: str
@@ -460,6 +565,11 @@ class OpenAIQaClient:
         )
         raw["classification"] = classification.model_dump(mode="json")
         return classification, raw
+
+    @staticmethod
+    def _normalized_word_sequence(value: str) -> list[str]:
+        normalized = unicodedata.normalize("NFKC", value).casefold()
+        return re.findall(r"\w+", normalized, flags=re.UNICODE)
 
     @staticmethod
     def _normalized_content(value: str) -> str:

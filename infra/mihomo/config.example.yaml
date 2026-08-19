@@ -1,26 +1,97 @@
 port: 7890
 socks-port: 7891
+redir-port: 7892
+
+# ВАЖНО для доступа других Docker-контейнеров к mihomo:7890
 allow-lan: true
 bind-address: '*'
+
+# ВАЖНО: не global
 mode: rule
+
 log-level: info
+
+# Внутри контейнера слушаем все интерфейсы.
+# Docker Compose при этом публикует 9090 только на 127.0.0.1 хоста.
 external-controller: '0.0.0.0:9090'
 
+
+# ============================================================
+# ВАШ СУЩЕСТВУЮЩИЙ СПИСОК VPN
+# ОСТАВИТЬ БЕЗ ИЗМЕНЕНИЙ
+# ============================================================
+
 proxies:
-  - name: CHANGE_ME
-    type: trojan
-    server: example.com
-    port: 443
-    password: change-me
+
+  - { name: Moldova, type: trojan, server: ..., port: 443, password: ... }
+  - { name: Netherlands, type: trojan, server: ..., port: 443, password: ... }
+  - { name: Portugal, type: trojan, server: ..., port: 443, password: ... }
+
+  # ...
+  # здесь ВСЕ остальные ваши страны
+  # ...
+
+  - { name: Australia, type: trojan, server: ..., port: 443, password: ... }
+
+
+# ============================================================
+# АВТОМАТИЧЕСКИЙ FAILOVER
+# ============================================================
 
 proxy-groups:
-  - name: PROXY
-    type: select
-    proxies:
-      - CHANGE_ME
-      - DIRECT
+
+  # Независимый VPN для OpenRouter
+  - name: OPENROUTER_AUTO
+    type: fallback
+
+    # Автоматически берём ВСЕ VPN из proxies:
+    include-all-proxies: true
+    exclude-type: direct
+
+    # Проверяем доступность именно OpenRouter
+    url: 'https://openrouter.ai/api/v1/models'
+
+    # Проверка каждые 30 секунд
+    interval: 30
+
+    # Проверять даже когда группа временно не используется
+    lazy: false
+
+    # Если узел не отвечает 5 сек — считаем его проблемным
+    timeout: 5000
+
+    # После одной ошибки форсируем перепроверку
+    max-failed-times: 1
+
+
+  # Независимый VPN для Telegram
+  - name: TELEGRAM_AUTO
+    type: fallback
+
+    include-all-proxies: true
+    exclude-type: direct
+
+    # Проверяем доступность именно Telegram
+    url: 'https://api.telegram.org'
+
+    interval: 30
+    lazy: false
+    timeout: 5000
+    max-failed-times: 1
+
+
+# ============================================================
+# МАРШРУТИЗАЦИЯ
+# ============================================================
 
 rules:
-  - DOMAIN-SUFFIX,openrouter.ai,PROXY
-  - DOMAIN-SUFFIX,api.telegram.org,PROXY
+
+  # OpenRouter идёт через свой автоматический VPN
+  - DOMAIN-SUFFIX,openrouter.ai,OPENROUTER_AUTO
+
+  # Telegram идёт через свой автоматический VPN
+  - DOMAIN-SUFFIX,api.telegram.org,TELEGRAM_AUTO
+
+  # Всё остальное — напрямую.
+  # Mango, PostgreSQL и т.д. через VPN не гоняем.
   - MATCH,DIRECT

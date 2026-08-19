@@ -153,7 +153,9 @@ def test_analysis_message_matches_business_template() -> None:
     assert "Автосервис: Nissan (+7 (812) 615-85-10)" in message
     assert "Сделка: 42" in message
     assert "Тип звонка: Критическая" in message
-    assert "Критические ошибки: Сотрудник сообщил заведомо неверную стоимость" in message
+    assert (
+        "Критические ошибки: Сотрудник сообщил заведомо неверную стоимость" in message
+    )
     assert message.index("❌ Ошибки") < message.index("🚨 Критические ошибки")
     assert "Оценка: 60, взвешенная" in message
     assert "Подробнее" not in message
@@ -196,6 +198,49 @@ def test_analysis_message_hides_minio_download_link_and_empty_phrases() -> None:
     assert "Автосервис: Volvo (+7 (812) 425-30-26)" in message
     assert "Почему риск" not in message
     assert "❌ Ошибки" not in message
+
+
+def test_sip_domain_is_not_used_as_service_phone_and_resolved_number_wins() -> None:
+    call = {
+        "id": "sip-call",
+        "direction": "incoming",
+        "from_number": "79052209632",
+        "to_number": "sip:user44@vpbx400100296.mangosip.ru",
+        "raw": {
+            "to_extension": "44",
+            "to_number": "sip:user44@vpbx400100296.mangosip.ru",
+            "mango_employee_summary": {
+                "extension": "44",
+                "name": "Сотрудник",
+                "line_id": 300024487,
+                "outgoingline": "sip:user44@vpbx400100296.mangosip.ru",
+                "phone_numbers": [],
+            },
+            "mango_employee_service_phone_candidates": ["78124253026"],
+        },
+    }
+    message = format_analysis_message(
+        call, quality(risk_level="normal", risk_reason="")
+    )
+    assert "Автосервис: Volvo (+7 (812) 425-30-26)" in message
+    assert "400100296" not in message
+    assert "👤 Сотрудник · incoming · 79052209632" in message
+    assert call_service_group(call) == "volvo_vag"
+
+
+def test_sip_domain_without_resolved_number_has_no_fake_phone() -> None:
+    call = {
+        "id": "sip-call",
+        "direction": "incoming",
+        "from_number": "79052209632",
+        "to_number": "sip:user44@vpbx400100296.mangosip.ru",
+        "raw": {"to_extension": "44"},
+    }
+    message = format_analysis_message(
+        call, quality(risk_level="normal", risk_reason="")
+    )
+    assert "Автосервис: не определён" in message
+    assert "400100296" not in message
 
 
 def test_dead_letter_format_and_prompt() -> None:

@@ -369,3 +369,106 @@ async def test_fetch_and_find_mango_user(settings) -> None:
     assert payload["extension"] == "11"
     assert "general.sips" in payload["ext_fields"]
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_employee_service_phone_resolves_line_id_to_public_number(
+    settings,
+) -> None:
+    client = MangoClient(settings)
+    employee = {
+        "general": {
+            "name": "Сотрудник 44",
+            "sips": [{"number": "user44@vpbx400100296.mangosip.ru"}],
+        },
+        "telephony": {
+            "extension": "44",
+            "outgoingline": "sip:user44@vpbx400100296.mangosip.ru",
+            "line_id": 300024487,
+            "numbers": [
+                {
+                    "number": "sip:user44@vpbx400100296.mangosip.ru",
+                    "protocol": "sip",
+                }
+            ],
+        },
+    }
+    client.request = AsyncMock(
+        return_value={
+            "result": 1000,
+            "lines": [
+                {
+                    "line_id": 300024487,
+                    "number": "78124253026",
+                    "name": None,
+                }
+            ],
+        }
+    )
+
+    assert await client.employee_service_phone_candidates(employee) == ["78124253026"]
+    endpoint, payload = client.request.await_args.args
+    assert endpoint == "incominglines"
+    assert payload == {}
+    assert (
+        client._normalize_public_phone("sip:user44@vpbx400100296.mangosip.ru") is None
+    )
+    assert client._normalize_public_phone("400100296") is None
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_calls_resolves_sip_even_when_full_enrichment_is_disabled(
+    settings,
+) -> None:
+    settings.mango_enrich_user_metadata = False
+    settings.mango_resolve_sip_service_number = True
+    client = MangoClient(settings)
+    row = {
+        "records": "recording-id",
+        "start": "1786702560",
+        "finish": "1786702654",
+        "from_number": "79052209632",
+        "to_extension": "44",
+        "to_number": "sip:user44@vpbx400100296.mangosip.ru",
+        "line_number": "sip:line28247@vpbx400100296.mangosip.ru",
+        "entry_id": "sip-call",
+    }
+    client.request = AsyncMock(
+        side_effect=[
+            {"key": "report"},
+            {
+                "users": {
+                    "general": {"name": "Сотрудник 44"},
+                    "telephony": {
+                        "extension": "44",
+                        "outgoingline": "sip:user44@vpbx400100296.mangosip.ru",
+                        "line_id": 300024487,
+                        "numbers": [],
+                    },
+                }
+            },
+            {
+                "result": 1000,
+                "lines": [{"line_id": 300024487, "number": "78124253026"}],
+            },
+        ]
+    )
+    client.request_with_status = AsyncMock(return_value=(200, {"data": [row]}))
+
+    calls = await client.fetch_calls(
+        datetime(2026, 8, 14, tzinfo=timezone.utc),
+        datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+
+    assert len(calls) == 1
+    raw = calls[0].raw
+    assert raw["mango_employee_summary"]["extension"] == "44"
+    assert raw["mango_employee_service_phone_candidates"] == ["78124253026"]
+    assert "mango_employee" not in raw
+    assert [call.args[0] for call in client.request.await_args_list] == [
+        "stats/request",
+        "config/users/request",
+        "incominglines",
+    ]
+    await client.aclose()

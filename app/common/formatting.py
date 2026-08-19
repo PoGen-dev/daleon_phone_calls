@@ -55,17 +55,26 @@ def _mango_employee(call: dict[str, Any]) -> dict[str, Any]:
     return employee if isinstance(employee, dict) else {}
 
 
+def _mango_employee_summary(call: dict[str, Any]) -> dict[str, Any]:
+    raw = call.get("raw") or {}
+    summary = raw.get("mango_employee_summary") or {}
+    return summary if isinstance(summary, dict) else {}
+
+
 def _manager(call: dict[str, Any]) -> str:
     raw = call.get("raw") or {}
     employee = _mango_employee(call)
+    summary = _mango_employee_summary(call)
     general = employee.get("general") or {}
     telephony = employee.get("telephony") or {}
     return str(
         raw.get("manager_name")
         or raw.get("user_name")
+        or summary.get("name")
         or (general.get("name") if isinstance(general, dict) else None)
         or raw.get("from_extension")
         or raw.get("to_extension")
+        or summary.get("extension")
         or (telephony.get("extension") if isinstance(telephony, dict) else None)
         or "-"
     )
@@ -110,20 +119,30 @@ SERVICE_BY_PHONE: dict[str, str] = {
 
 
 def _normalize_phone(value: Any) -> str:
-    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    text = str(value or "").strip().lower()
+    if not text or text.startswith("sip:") or "@" in text or "mangosip" in text:
+        return ""
+    digits = "".join(ch for ch in text if ch.isdigit())
     if len(digits) == 10 and digits.startswith("9"):
         return f"7{digits}"
     if len(digits) == 11 and digits.startswith("8"):
         return f"7{digits[1:]}"
-    return digits
+    if len(digits) == 11 and digits.startswith("7"):
+        return digits
+    return ""
 
 
 def _called_phone_candidates(call: dict[str, Any]) -> list[Any]:
     raw = call.get("raw") or {}
     employee = _mango_employee(call)
+    summary = _mango_employee_summary(call)
     general = employee.get("general") or {}
     telephony = employee.get("telephony") or {}
+    service_candidates = raw.get("mango_employee_service_phone_candidates") or []
+    if not isinstance(service_candidates, list):
+        service_candidates = [service_candidates]
     candidates: list[Any] = [
+        *service_candidates,
         call.get("to_number"),
         call.get("called_number"),
         call.get("destination_number"),
@@ -131,6 +150,9 @@ def _called_phone_candidates(call: dict[str, Any]) -> list[Any]:
         raw.get("called_number"),
         raw.get("destination_number"),
         raw.get("line_number"),
+        summary.get("outgoingline"),
+        *summary.get("phone_numbers", []),
+        summary.get("mobile"),
     ]
     if isinstance(telephony, dict):
         candidates.append(telephony.get("outgoingline"))
