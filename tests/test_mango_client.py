@@ -472,3 +472,23 @@ async def test_fetch_calls_resolves_sip_even_when_full_enrichment_is_disabled(
         "incominglines",
     ]
     await client.aclose()
+
+
+def test_secondary_account_uses_own_signature_and_namespaced_call_id(settings) -> None:
+    client = MangoClient(
+        settings,
+        api_key="second-key",
+        api_salt="second-salt",
+        account_name="second",
+        namespace_call_ids=True,
+    )
+    json_payload, signature = client.sign({"date_from": 1})
+    expected = hashlib.sha256(
+        f"second-key{json_payload}second-salt".encode()
+    ).hexdigest()
+    assert signature == expected
+
+    call = client._row_to_call({"entry_id": "same-id", "records": "rec-2"})
+    assert call.id == "second:same-id"
+    assert call.raw["mango_account"] == "second"
+    assert call.raw["mango_original_id"] == "same-id"

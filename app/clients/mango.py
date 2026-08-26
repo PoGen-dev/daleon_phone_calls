@@ -43,11 +43,25 @@ class MangoApiError(RuntimeError):
 
 
 class MangoClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        api_key: Any | None = None,
+        api_salt: Any | None = None,
+        account_name: str = "primary",
+        namespace_call_ids: bool = False,
+    ) -> None:
         self.settings = settings
         self.base_url = settings.mango_api_base_url.rstrip("/")
-        self.api_key = settings.mango_api_key.get_secret_value()
-        self.api_salt = settings.mango_api_salt.get_secret_value()
+        self.api_key = self._credential_value(
+            settings.mango_api_key if api_key is None else api_key
+        )
+        self.api_salt = self._credential_value(
+            settings.mango_api_salt if api_salt is None else api_salt
+        )
+        self.account_name = account_name
+        self.namespace_call_ids = namespace_call_ids
         self.tz = ZoneInfo(settings.mango_default_timezone)
         self._recording_download_lock = asyncio.Lock()
         self._last_recording_download_at = 0.0
@@ -62,6 +76,12 @@ class MangoClient:
             follow_redirects=True,
             transport=transport,
         )
+
+
+    @staticmethod
+    def _credential_value(value: Any) -> str:
+        getter = getattr(value, "get_secret_value", None)
+        return str(getter() if callable(getter) else value or "")
 
     async def aclose(self) -> None:
         await self.http.aclose()
@@ -647,8 +667,15 @@ class MangoClient:
         finished_at = self._parse_mango_datetime(
             self._first(row, "finish", "end_time", "finished_at")
         )
-        generated_id = (
+        generated_id = str(
             call_id or entry_id or recording_id or self._stable_fallback_id(row)
+        )
+        raw["mango_account"] = self.account_name
+        raw["mango_original_id"] = generated_id
+        persisted_id = (
+            f"{self.account_name}:{generated_id}"
+            if self.namespace_call_ids
+            else generated_id
         )
         direction = self._first(row, "call_direction", "direction")
         if not direction:
@@ -657,7 +684,7 @@ class MangoClient:
             elif self._first(row, "to_extension"):
                 direction = "incoming"
         return CallRecord(
-            id=str(generated_id),
+            id=persisted_id,
             entry_id=entry_id,
             call_id=call_id,
             recording_id=recording_id,

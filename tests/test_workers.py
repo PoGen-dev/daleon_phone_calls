@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import asyncio
 
 from app.common.models import CallClassification, CallRecord, QualityResult
 from app.services import (
@@ -60,6 +61,61 @@ def classification(call_type: str = "appointment") -> CallClassification:
         confidence="high",
     )
 
+
+@pytest.mark.asyncio
+async def test_configured_mango_sources_keep_primary_compatible_and_namespace_extras(
+    settings,
+) -> None:
+    settings.mango_accounts = [
+        {"name": "second", "api_key": "key-2", "api_salt": "salt-2"},
+        {"name": "third", "api_key": "key-3", "api_salt": "salt-3"},
+    ]
+    # Assignment bypasses validation for nested values in Pydantic models, so rebuild.
+    settings = type(settings).model_validate(settings.model_dump())
+
+    sources = mango_worker._configured_mango_sources(settings)
+    try:
+        assert [source.name for source in sources] == ["primary", "second", "third"]
+        assert [source.state_name for source in sources] == [
+            mango_worker.STATE_NAME,
+            f"{mango_worker.STATE_NAME}:second",
+            f"{mango_worker.STATE_NAME}:third",
+        ]
+        assert sources[0].client.api_key == "mango-key"
+        assert sources[0].client.namespace_call_ids is False
+        assert sources[1].client.api_key == "key-2"
+        assert sources[1].client.namespace_call_ids is True
+        assert sources[1].client._row_to_call({"entry_id": "c1"}).id == "second:c1"
+    finally:
+        await asyncio.gather(*(source.client.aclose() for source in sources))
+
+
+def test_configured_mango_sources_validate_credentials() -> None:
+    settings_type = mango_worker.Settings
+    with pytest.raises(RuntimeError, match="both be set"):
+        mango_worker._configured_mango_sources(
+            settings_type(_env_file=None, mango_api_key="key", mango_api_salt="")
+        )
+    with pytest.raises(RuntimeError, match="No Mango credentials"):
+        mango_worker._configured_mango_sources(settings_type(_env_file=None))
+    with pytest.raises(RuntimeError, match="api_key and api_salt"):
+        mango_worker._configured_mango_sources(
+            settings_type(
+                _env_file=None,
+                mango_accounts=[{"name": "empty", "api_key": "", "api_salt": "salt"}],
+            )
+        )
+    with pytest.raises(RuntimeError, match="Duplicate Mango account name"):
+        mango_worker._configured_mango_sources(
+            settings_type(
+                _env_file=None,
+                mango_api_key="key",
+                mango_api_salt="salt",
+                mango_accounts=[
+                    {"name": "primary", "api_key": "key-2", "api_salt": "salt-2"}
+                ],
+            )
+        )
 
 def test_cursor_and_poll_windows(settings) -> None:
     assert mango_worker._parse_cursor(None) is None

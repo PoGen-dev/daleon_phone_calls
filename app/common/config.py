@@ -3,9 +3,14 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
+class MangoAccountConfig(BaseModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    api_key: SecretStr
+    api_salt: SecretStr
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -51,6 +56,7 @@ class Settings(BaseSettings):
     mango_api_base_url: str = "https://app.mango-office.ru/vpbx"
     mango_api_key: SecretStr = Field(default=SecretStr(""))
     mango_api_salt: SecretStr = Field(default=SecretStr(""))
+    mango_accounts: list[MangoAccountConfig] = Field(default_factory=list)
     mango_stats_request_endpoint: str = "stats/request"
     mango_stats_result_endpoint: str = "stats/result"
     mango_recording_download_endpoint: str = "queries/recording/post/"

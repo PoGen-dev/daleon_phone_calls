@@ -29,6 +29,32 @@ docker compose up --build -d
 docker compose ps
 ```
 
+### Несколько MANGO API key/salt
+
+Существующая пара `MANGO_API_KEY` / `MANGO_API_SALT` остаётся основным (`primary`) источником и полностью
+обратно совместима с уже накопленными данными. Дополнительные кабинеты/группы задаются JSON-массивом
+`MANGO_ACCOUNTS`:
+
+```env
+MANGO_API_KEY=ключ_основной_АТС
+MANGO_API_SALT=salt_основной_АТС
+MANGO_ACCOUNTS='[{"name":"second","api_key":"ключ_2","api_salt":"salt_2"},{"name":"third","api_key":"ключ_3","api_salt":"salt_3"}]'
+```
+
+`name` — стабильный технический идентификатор источника: латинские буквы/цифры и `._-`, без пробелов.
+Для каждой дополнительной АТС worker:
+
+- создаёт отдельный Mango API client и подписывает запросы её собственными `api_key/api_salt`;
+- ведёт отдельный cursor в `worker_state` (`mango_worker_cursor:<name>`);
+- добавляет `mango_account` и `mango_original_id` в `calls.raw`;
+- сохраняет звонок под ID `<name>:<original_mango_id>`, чтобы одинаковые Mango ID из разных АТС не конфликтовали;
+- скачивает запись тем же API client, которым был получен звонок.
+
+Основной `MANGO_API_KEY/MANGO_API_SALT` сохраняет прежние ID звонков и прежний cursor `mango_worker_cursor`,
+поэтому включение дополнительных источников не создаёт дублей уже загруженных звонков основного кабинета.
+Можно также оставить основную пару пустой и описать все источники только через `MANGO_ACCOUNTS`; в этом случае ID
+всех звонков будут namespaced.
+
 Интерфейсы после запуска:
 
 - API: `http://localhost:8080`
@@ -306,24 +332,9 @@ docker compose up -d
 
 ```bash
 sudo docker compose down -v --remove-orphans
-```
-
-```bash
 sudo docker compose rm -f
-```
-
-```bash
 sudo docker image prune -f
-```
-
-```bash
 sudo docker compose build --no-cache
-```
-
-```bash
 sudo docker compose pull
-```
-
-```bash
 sudo docker compose up -d
 ```
