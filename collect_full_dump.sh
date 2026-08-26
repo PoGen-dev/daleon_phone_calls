@@ -144,62 +144,81 @@ docker compose exec -T api pip freeze \
 # 4. CONFIGURATION WITHOUT SECRETS
 # ============================================================
 
+echo "Collecting sanitized configuration..."
+
 if [[ -f ".env" ]]; then
 
-    awk '
-    {
-        line=$0
+    python3 - <<'PY' > "${DUMP_DIR}/config/env.sanitized"
+from pathlib import Path
 
-        if (line ~ /^[[:space:]]*#/ || index(line,"=") == 0) {
-            print line
-            next
-        }
+SENSITIVE = (
+    "api_key",
+    "api_salt",
+    "token",
+    "secret",
+    "password",
+    "postgres_dsn",
+    "proxy_url",
+    "mango_accounts",
+    "access_key",
+)
 
-        pos=index(line,"=")
-        key=substr(line,1,pos-1)
-        lkey=tolower(key)
+path = Path(".env")
 
-        if (
-            lkey ~ /api_key/ ||
-            lkey ~ /api_salt/ ||
-            lkey ~ /token/ ||
-            lkey ~ /secret/ ||
-            lkey ~ /password/ ||
-            lkey ~ /postgres_dsn/ ||
-            lkey ~ /proxy_url/ ||
-            lkey ~ /mango_accounts/ ||
-            lkey ~ /access_key/
-        ) {
-            print key "=<REDACTED>"
-        } else {
-            print line
-        }
-    }
-    ' .env > "${DUMP_DIR}/config/env.sanitized"
+for raw_line in path.read_text(encoding="utf-8").splitlines():
+    line = raw_line.rstrip("\r")
+
+    stripped = line.strip()
+
+    if not stripped or stripped.startswith("#") or "=" not in line:
+        print(line)
+        continue
+
+    key, value = line.split("=", 1)
+    key_lower = key.strip().lower()
+
+    if any(item in key_lower for item in SENSITIVE):
+        print(f"{key}=<REDACTED>")
+    else:
+        print(line)
+PY
+
 fi
 
 
-docker compose config 2>/dev/null | \
-awk '
-{
-    low=tolower($0)
+docker compose config 2>/dev/null | python3 -c '
+import sys
+import re
 
-    if (
-        low ~ /api_key/ ||
-        low ~ /api_salt/ ||
-        low ~ /token:/ ||
-        low ~ /secret/ ||
-        low ~ /password/ ||
-        low ~ /postgres_dsn/ ||
-        low ~ /proxy_url/ ||
-        low ~ /mango_accounts/ ||
-        low ~ /access_key/
-    ) {
-        sub(/:.*/, ": <REDACTED>")
-    }
+patterns = (
+    "api_key",
+    "api_salt",
+    "token",
+    "secret",
+    "password",
+    "postgres_dsn",
+    "proxy_url",
+    "mango_accounts",
+    "access_key",
+)
 
-    print
-}
+for line in sys.stdin:
+    lower = line.lower()
+
+    if any(pattern in lower for pattern in patterns):
+        indent = line[:len(line) - len(line.lstrip())]
+        stripped = line.strip()
+
+        if ":" in stripped:
+            key = stripped.split(":", 1)[0]
+            print(f"{indent}{key}: <REDACTED>")
+        elif "=" in stripped:
+            key = stripped.split("=", 1)[0]
+            print(f"{indent}{key}=<REDACTED>")
+        else:
+            print(f"{indent}<REDACTED>")
+    else:
+        print(line, end="")
 ' > "${DUMP_DIR}/config/docker-compose.sanitized.yaml" || true
 
 
