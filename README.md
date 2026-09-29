@@ -250,55 +250,52 @@ docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations
 и перенесите SQL-схему в миграции. Для строгой атомарности PostgreSQL/Kafka рекомендуется transactional outbox.
 
 
-## VPN/proxy container
-Проект поддерживает локальный proxy-сервис `mihomo` внутри Docker Compose. OpenRouter и Telegram можно направить
-через несколько VPN-узлов разных стран с автоматическим failover. В `config.example.yaml` используются две независимые
-`fallback`-группы: `OPENROUTER_AUTO` и `TELEGRAM_AUTO`. Это позволяет, например, оставить Telegram на стране A, но
-автоматически перевести OpenRouter на страну B, если страна A перестала открывать только OpenRouter.
+## AmneziaVPN SOCKS5
 
-1. Создайте runtime-конфиг, который не коммитится в Git:
+OpenRouter и Telegram направляются через SOCKS5-сервис, установленный на сервере AmneziaVPN. Mango, PostgreSQL, Kafka
+и MinIO продолжают работать по обычному прямому маршруту. Локальный контейнер `mihomo` больше не требуется.
 
-```bash
-mkdir -p infra/mihomo
-cp infra/mihomo/config.example.yaml infra/mihomo/config.yaml
-# замените COUNTRY_A/COUNTRY_B на реальные узлы разных стран, сохранив fallback-группы
-```
-
-Для доступа из других контейнеров в конфиге должны быть значения:
-
-```yaml
-port: 7890
-socks-port: 7891
-allow-lan: true
-bind-address: '*'
-external-controller: '0.0.0.0:9090'
-```
-
-2. В `.env` включите профиль и направьте внешние API через контейнер:
+Установите SOCKS5-сервис в AmneziaVPN на VPN-сервере и скопируйте из его настроек `host`, `port`, `username` и
+`password`. Затем добавьте/обновите значения в `.env`:
 
 ```env
-COMPOSE_PROFILES=vpn
-OPENROUTER_PROXY_URL=http://mihomo:7890
-TELEGRAM_PROXY_URL=http://mihomo:7890
-NO_PROXY=localhost,127.0.0.1,postgres,kafka,zookeeper,minio,api,mihomo
+AMNEZIA_SOCKS5_ENABLED=true
+AMNEZIA_SOCKS5_HOST=203.0.113.10
+AMNEZIA_SOCKS5_PORT=1080
+AMNEZIA_SOCKS5_USERNAME=replace-me
+AMNEZIA_SOCKS5_PASSWORD=replace-me
+
+# Необязательный аварийный/диагностический fallback. При включённой Amnezia она имеет приоритет.
+OPENROUTER_PROXY_URL=
+TELEGRAM_PROXY_URL=
+NO_PROXY=localhost,127.0.0.1,postgres,kafka,zookeeper,minio,api
 ```
 
-3. Пересоздайте сервисы, которые ходят во внешние API:
+`AMNEZIA_SOCKS5_USERNAME` и `AMNEZIA_SOCKS5_PASSWORD` автоматически URL-encode'ятся приложением, поэтому спецсимволы
+в логине/пароле не нужно экранировать вручную. Реальные значения нельзя коммитить в Git.
+
+Поддержка SOCKS обеспечивается зависимостью `httpx[socks]`. После перехода со старого image пересоберите worker'ы:
 
 ```bash
-docker compose up -d --build --force-recreate mihomo transcriber-worker quality-worker telegram-worker
+docker compose build --no-cache transcriber-worker quality-worker telegram-worker
+docker compose up -d --force-recreate transcriber-worker quality-worker telegram-worker
 ```
-Проверка текущего выбранного узла каждой fallback-группы:
+
+После пересоздания worker'ов удалите orphan-контейнер старого `mihomo` без удаления volumes:
 
 ```bash
-python scripts/check_vpn_failover.py
+docker compose up -d --remove-orphans
 ```
 
-Проверка логов proxy:
+Проверка маршрута Amnezia, внешнего IP, OpenRouter и Telegram без отправки пользовательских сообщений:
 
 ```bash
-docker compose logs -f --tail=100 mihomo
+python scripts/test_proxy.py --with-error-bot
 ```
+
+В выводе должны быть `AMNEZIA: enabled=True`, внешний `EXIT_IP` сервера Amnezia и успешные проверки OpenRouter/Telegram.
+Если `AMNEZIA_SOCKS5_ENABLED=false`, приложение использует необязательные `OPENROUTER_PROXY_URL` /
+`TELEGRAM_PROXY_URL`, а при пустых значениях работает напрямую.
 
 
 ## Как пересобрать весь проект Windows 

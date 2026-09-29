@@ -256,12 +256,11 @@ class OpenAIQaClient:
         headers = {"X-Title": settings.openrouter_app_name}
         if settings.openrouter_http_referer:
             headers["HTTP-Referer"] = settings.openrouter_http_referer
-        proxy_url = settings.openrouter_proxy_url or None
-        openrouter_http_client = (
-            httpx.AsyncClient(proxy=proxy_url) if proxy_url else None
+        proxy_url = settings.openrouter_effective_proxy_url
+        openrouter_http_client = httpx.AsyncClient(
+            proxy=proxy_url,
+            trust_env=False,
         )
-
-        proxy = settings.openrouter_proxy_url
 
         self.client = AsyncOpenAI(
             api_key=api_key or None,
@@ -280,6 +279,7 @@ class OpenAIQaClient:
             headers={**headers, "Authorization": f"Bearer {api_key}"},
             timeout=self.transcribe_timeout,
             proxy=proxy_url,
+            trust_env=False,
         )
         self.transcribe_timeout_log = {
             "connect": settings.openrouter_transcribe_connect_timeout_seconds,

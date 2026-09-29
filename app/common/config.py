@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Annotated
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -112,9 +113,47 @@ class Settings(BaseSettings):
 
     api_host: str = "0.0.0.0"
     api_port: int = 8080
+    # Amnezia SOCKS5 is the preferred external route for OpenRouter and Telegram.
+    # Keep the legacy per-service URLs as optional fallback/diagnostic overrides.
+    amnezia_socks5_enabled: bool = False
+    amnezia_socks5_host: str = ""
+    amnezia_socks5_port: int = Field(default=1080, ge=1, le=65535)
+    amnezia_socks5_username: SecretStr = Field(default=SecretStr(""))
+    amnezia_socks5_password: SecretStr = Field(default=SecretStr(""))
 
     openrouter_proxy_url: str | None = None
     telegram_proxy_url: str | None = None
+
+
+    @property
+    def amnezia_socks5_url(self) -> str | None:
+        if not self.amnezia_socks5_enabled:
+            return None
+
+        host = self.amnezia_socks5_host.strip()
+        username = self.amnezia_socks5_username.get_secret_value().strip()
+        password = self.amnezia_socks5_password.get_secret_value()
+        placeholders = {"", "replace-me", "change-me", "amnezia.example.com"}
+        if host.lower() in placeholders:
+            raise ValueError(
+                "AMNEZIA_SOCKS5_ENABLED=true but AMNEZIA_SOCKS5_HOST is not configured"
+            )
+        if username.lower() in placeholders or password.lower() in placeholders:
+            raise ValueError(
+                "AMNEZIA_SOCKS5_ENABLED=true but SOCKS5 username/password are not configured"
+            )
+
+        auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+        return f"socks5://{auth}{host}:{self.amnezia_socks5_port}"
+
+    @property
+    def openrouter_effective_proxy_url(self) -> str | None:
+        return self.amnezia_socks5_url or self.openrouter_proxy_url
+
+    @property
+    def telegram_effective_proxy_url(self) -> str | None:
+        return self.amnezia_socks5_url or self.telegram_proxy_url
+
 
     @property
     def mango_fields_list(self) -> list[str]:

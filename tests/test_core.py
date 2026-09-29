@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from app.common.config import Settings, get_settings
 from app.common.formatting import (
@@ -60,7 +60,34 @@ def test_settings_parse_fields_and_cache() -> None:
     assert Settings(_env_file=None).mango_recording_download_interval_seconds == 2
     assert Settings(_env_file=None).openrouter_proxy_url is None
     assert Settings(_env_file=None).telegram_proxy_url is None
+    assert Settings(_env_file=None).amnezia_socks5_enabled is False
 
+    amnezia = Settings(
+        _env_file=None,
+        amnezia_socks5_enabled=True,
+        amnezia_socks5_host="vpn.example.test",
+        amnezia_socks5_port=1081,
+        amnezia_socks5_username=SecretStr("user@example"),
+        amnezia_socks5_password=SecretStr("p@ss:word"),
+        openrouter_proxy_url="http://legacy:7890",
+    )
+    assert (
+        amnezia.amnezia_socks5_url
+        == "socks5://user%40example:p%40ss%3Aword@vpn.example.test:1081"
+    )
+    assert amnezia.openrouter_effective_proxy_url == amnezia.amnezia_socks5_url
+    amnezia.amnezia_socks5_enabled = False
+    assert amnezia.openrouter_effective_proxy_url == "http://legacy:7890"
+
+    invalid_amnezia = Settings(
+        _env_file=None,
+        amnezia_socks5_enabled=True,
+        amnezia_socks5_host="amnezia.example.com",
+        amnezia_socks5_username=SecretStr("replace-me"),
+        amnezia_socks5_password=SecretStr("replace-me"),
+    )
+    with pytest.raises(ValueError, match="AMNEZIA_SOCKS5_HOST"):
+        _ = invalid_amnezia.amnezia_socks5_url
     assert Settings(_env_file=None).openrouter_transcribe_connect_timeout_seconds == 30
     assert Settings(_env_file=None).openrouter_transcribe_write_timeout_seconds == 120
     assert Settings(_env_file=None).openrouter_transcribe_read_timeout_seconds == 900

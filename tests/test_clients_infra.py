@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import SecretStr
 
 from app.clients.minio import MinioStorage
 from app.clients.openai_qa import (
@@ -72,10 +73,17 @@ async def test_telegram_sends_to_both_channels_and_validates_response(
 ) -> None:
     http_client = MagicMock(wraps=__import__("httpx").AsyncClient)
     monkeypatch.setattr("app.clients.telegram.httpx.AsyncClient", http_client)
-    settings.telegram_proxy_url = "http://mihomo:7890"
+    settings.amnezia_socks5_enabled = True
+    settings.amnezia_socks5_host = "vpn.example.test"
+    settings.amnezia_socks5_username = SecretStr("user@example")
+    settings.amnezia_socks5_password = SecretStr("p@ss:word")
     telegram = TelegramClient(settings)
     await telegram.http.aclose()
-    assert http_client.call_args.kwargs["proxy"] == "http://mihomo:7890"
+    assert (
+        http_client.call_args.kwargs["proxy"]
+        == "socks5://user%40example:p%40ss%3Aword@vpn.example.test:1080"
+    )
+    assert http_client.call_args.kwargs["trust_env"] is False
     ok = SimpleNamespace(raise_for_status=MagicMock(), json=lambda: {"ok": True})
     rejected = SimpleNamespace(
         raise_for_status=MagicMock(), json=lambda: {"ok": False, "description": "bad"}
@@ -143,12 +151,23 @@ def test_openrouter_client_uses_configured_proxy(settings, monkeypatch) -> None:
     openai_constructor = MagicMock(return_value=SimpleNamespace(close=AsyncMock()))
     monkeypatch.setattr("app.clients.openai_qa.httpx.AsyncClient", http_client)
     monkeypatch.setattr("app.clients.openai_qa.AsyncOpenAI", openai_constructor)
-    settings.openrouter_proxy_url = "http://mihomo:7890"
+    settings.amnezia_socks5_enabled = True
+    settings.amnezia_socks5_host = "vpn.example.test"
+    settings.amnezia_socks5_username = SecretStr("proxy-user")
+    settings.amnezia_socks5_password = SecretStr("proxy-pass")
 
     ai = OpenAIQaClient(settings)
 
-    assert http_client.call_args_list[0].kwargs["proxy"] == "http://mihomo:7890"
-    assert http_client.call_args_list[1].kwargs["proxy"] == "http://mihomo:7890"
+    assert (
+        http_client.call_args_list[0].kwargs["proxy"]
+        == "socks5://proxy-user:proxy-pass@vpn.example.test:1080"
+    )
+    assert (
+        http_client.call_args_list[1].kwargs["proxy"]
+        == "socks5://proxy-user:proxy-pass@vpn.example.test:1080"
+    )
+    assert http_client.call_args_list[0].kwargs["trust_env"] is False
+    assert http_client.call_args_list[1].kwargs["trust_env"] is False
     assert openai_constructor.call_args.kwargs["http_client"] is sdk_http
     assert ai.stt_http is stt_http
 
