@@ -335,3 +335,141 @@ sudo docker compose build --no-cache
 sudo docker compose pull
 sudo docker compose up -d
 ```
+
+## Web dashboard (React + FastAPI)
+
+В проекте есть аналитический веб-дашборд по историческим звонкам. Backend использует существующий FastAPI/PostgreSQL,
+frontend собирается React/Vite и обслуживается отдельным nginx-контейнером `dashboard`.
+
+### Безопасность и вход администратора
+
+Все `/analytics/*` endpoints защищены серверной авторизацией. React не хранит пароль или session token в localStorage:
+после успешного входа FastAPI выдаёт подписанную `HttpOnly` cookie с `SameSite=Strict`. Подпись проверяется на каждом
+analytics-запросе, включая прослушивание аудио и CSV export. Dashboard nginx наружу проксирует только `/api/auth/*` и
+`/api/analytics/*`; остальные operational API routes через dashboard origin недоступны. Порт FastAPI по умолчанию также
+публикуется только на `127.0.0.1`.
+
+Защита включена по умолчанию и намеренно не имеет рабочего default password. Перед пересозданием `api` добавьте в `.env`:
+
+```env
+API_BIND=127.0.0.1
+API_PUBLIC_PORT=8080
+
+DASHBOARD_BIND=127.0.0.1
+DASHBOARD_PORT=3000
+DASHBOARD_AUTH_ENABLED=true
+DASHBOARD_ADMIN_USERNAME=admin
+DASHBOARD_ADMIN_PASSWORD=put-a-long-random-password-here
+DASHBOARD_SESSION_SECRET=put-a-random-secret-here
+DASHBOARD_SESSION_TTL_SECONDS=28800
+DASHBOARD_COOKIE_SECURE=false
+```
+
+Session secret удобно сгенерировать так:
+
+```bash
+openssl rand -hex 32
+```
+
+`DASHBOARD_ADMIN_PASSWORD` должен содержать минимум 12 символов. Если auth включён, а password/session secret пустые,
+короткие или оставлены стандартными placeholders, API не стартует — это специально сделано, чтобы dashboard не оказался
+случайно открыт без защиты.
+
+Для localhost или SSH tunnel оставьте `DASHBOARD_COOKIE_SECURE=false`. Если dashboard публикуется через HTTPS reverse
+proxy, установите:
+
+```env
+DASHBOARD_COOKIE_SECURE=true
+```
+
+### Аналитика
+
+Dashboard показывает и пересчитывает по общим server-side фильтрам:
+
+- KPI по звонкам, среднему score, analysis coverage, critical, сделкам, записям, pipeline errors и длительности;
+- изменение ключевых KPI относительно предыдущего периода той же длины;
+- быстрые периоды: сегодня / 7 / 30 / 90 дней / вся история;
+- воронку `calls → transcription → classification → quality analysis → notification`;
+- динамику количества звонков и среднего score по дням;
+- распределение по `risk_level`, `call_type`, pipeline status и длительности;
+- средние значения шести критериев качества и самый слабый критерий;
+- блок «Требуют внимания»: pipeline errors, critical и звонки со score < 60;
+- аналитику менеджеров: calls, score, analysis coverage, critical rate, сделки, конверсия, записи, длительность;
+- server-side фильтры по периоду, Mango account, менеджеру, типу, риску, статусу, направлению, score,
+  длительности, наличию transcription/quality и полнотекстовый поиск;
+- server-side сортировку, размер страницы и пагинацию;
+- CSV export текущего отфильтрованного среза (до 50 000 строк);
+- подробную карточку звонка с вкладками `Обзор`, `Транскрипт`, `Техническое`: аудио, summary, risk reason,
+  recommendation, criteria, objections, next step, critical errors, grounding diagnostics и Mango metadata.
+
+По умолчанию dashboard доступен только на localhost хоста:
+
+```env
+DASHBOARD_BIND=127.0.0.1
+DASHBOARD_PORT=3000
+```
+
+Для удалённого доступа без отдельного reverse proxy используйте SSH tunnel:
+
+```bash
+ssh -L 3000:127.0.0.1:3000 user@server
+```
+
+и откройте `http://127.0.0.1:3000` локально.
+
+### Запуск/обновление
+
+Индексы migration `005_dashboard_indexes.sql` достаточно применить один раз к существующей БД:
+
+
+```bash
+docker compose exec -T postgres psql -U app -d calls < infra/postgres/migrations/005_dashboard_indexes.sql
+```
+
+После изменения dashboard/auth пересоберите API и frontend:
+
+```bash
+docker compose build api dashboard
+docker compose up -d --force-recreate api dashboard
+```
+
+Проверка health API с хоста:
+
+```bash
+curl -fsS http://127.0.0.1:8080/health
+```
+
+Проверка защиты (без cookie должен быть `401`):
+
+```bash
+curl -i http://127.0.0.1:3000/api/analytics/filters
+```
+
+Проверка login через cookie jar:
+
+```bash
+curl -i -c /tmp/daleon-dashboard.cookies \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"YOUR_PASSWORD"}' \
+  http://127.0.0.1:3000/api/auth/login
+
+curl -b /tmp/daleon-dashboard.cookies \
+  http://127.0.0.1:3000/api/analytics/filters
+```
+
+Backend endpoints:
+
+```text
+POST /auth/login
+GET  /auth/me
+POST /auth/logout
+
+GET /analytics/filters
+GET /analytics/overview
+GET /analytics/calls
+GET /analytics/export.csv
+GET /analytics/calls/{call_id}
+GET /analytics/calls/{call_id}/audio
+```
+
+Все агрегаты `/analytics/overview`, список `/analytics/calls` и CSV export используют одинаковый набор фильтров.

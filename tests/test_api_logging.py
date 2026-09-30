@@ -60,6 +60,11 @@ def test_logging_configuration_accepts_unknown_level() -> None:
 async def test_api_lifespan_opens_and_closes_resources(monkeypatch) -> None:
     pool = SimpleNamespace(close=AsyncMock())
     monkeypatch.setattr(api.asyncpg, "create_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(
+        api.DashboardAuthManager,
+        "from_settings",
+        lambda _settings: SimpleNamespace(enabled=True),
+    )
     storage = object()
     monkeypatch.setattr(api, "MinioStorage", lambda _settings: storage)
     fake_app = SimpleNamespace(state=SimpleNamespace())

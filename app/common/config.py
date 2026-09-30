@@ -113,6 +113,15 @@ class Settings(BaseSettings):
 
     api_host: str = "0.0.0.0"
     api_port: int = 8080
+    # Dashboard authentication is enabled by default. The API intentionally refuses
+    # to start with weak/empty credentials when protection is enabled.
+    dashboard_auth_enabled: bool = True
+    dashboard_admin_username: str = "admin"
+    dashboard_admin_password: SecretStr = Field(default=SecretStr(""))
+    dashboard_session_secret: SecretStr = Field(default=SecretStr(""))
+    dashboard_session_ttl_seconds: int = Field(default=28800, ge=300, le=604800)
+    dashboard_cookie_secure: bool = False
+
     # Amnezia SOCKS5 is the preferred external route for OpenRouter and Telegram.
     # Keep the legacy per-service URLs as optional fallback/diagnostic overrides.
     amnezia_socks5_enabled: bool = False

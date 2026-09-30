@@ -12,6 +12,7 @@ services:
       - ./infra/postgres/migrations/002_telegram_chat_ids.sql:/docker-entrypoint-initdb.d/002-telegram-chat-ids.sql:ro
       - ./infra/postgres/migrations/003_outbox.sql:/docker-entrypoint-initdb.d/003-outbox.sql:ro
       - ./infra/postgres/migrations/004_call_classifications.sql:/docker-entrypoint-initdb.d/004-call-classifications.sql:ro
+      - ./infra/postgres/migrations/005_dashboard_indexes.sql:/docker-entrypoint-initdb.d/005-dashboard-indexes.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d calls"]
       interval: 5s
@@ -86,7 +87,8 @@ services:
     command: python -m app.services.api
     restart: unless-stopped
     env_file: .env
-    ports: ["8080:8080"]
+    ports:
+      - "${API_BIND:-127.0.0.1}:${API_PUBLIC_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -97,6 +99,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  dashboard:
+    build:
+      context: ./dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
 
   mango-worker:
     build: .
